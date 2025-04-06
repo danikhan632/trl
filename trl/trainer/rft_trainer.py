@@ -326,7 +326,7 @@ def split_cot(text, delim, threshold_factor=1.0):
 
 
 # =====================================================
-# RFT Trainer Class
+# RFT Trainer Class (Only __init__ and train are shown for brevity, assuming others are unchanged)
 # =====================================================
 class RFTTrainer(Trainer):
     """
@@ -335,8 +335,7 @@ class RFTTrainer(Trainer):
     """
     _tag_names = ["trl", "rft"]
 
-
-
+    # --- __init__ method remains the same as in the provided code ---
     def __init__(
         self,
         model: Union[str, PreTrainedModel],
@@ -350,44 +349,50 @@ class RFTTrainer(Trainer):
         peft_config: Optional[Any] = None,
         **kwargs,
     ):
-        # --- Argument Validation and Merging ---
         if not isinstance(rft_config, RFTConfig):
             raise TypeError("`rft_config` must be an instance of RFTConfig.")
-        self.rft_config = rft_config # Store RFT specific settings
+        self.rft_config = rft_config
 
-        # --- Load Model ---
         model_kwargs = rft_config.model_init_kwargs or {}
         if isinstance(model, str):
              model = AutoModelForCausalLM.from_pretrained(model, **model_kwargs)
 
-
-
-        # --- Initialize Accelerator Early ---
-        # `gradient_accumulation_steps` is read from `args` by Accelerator
         self.accelerator = Accelerator(gradient_accumulation_steps=rft_config.gradient_accumulation_steps)
-        self.processing_class = processing_class
+        self.processing_class = processing_class # Store tokenizer alias
 
-        # --- Attach Value Head to Model ---
-        model_config = model.config
-        if is_peft_available() and isinstance(model, PeftModel):
-             model_config = model.base_model.model.config
-        value_head = torch.nn.Linear(model_config.hidden_size, 1)
-        with torch.no_grad():
-            value_head.weight.data.normal_(mean=0.0, std=1/(model_config.hidden_size + 1))
-            value_head.bias.data.zero_()
-        setattr(model, 'value_head', value_head)
+        # --- Attach Value Head if not present ---
+        # Check if value head already exists (e.g., from checkpoint)
+        if not hasattr(model, 'value_head'):
+            model_config = model.config
+            if is_peft_available() and isinstance(model, PeftModel):
+                model_config = model.base_model.model.config
+            
+            # Ensure model_config has hidden_size
+            if not hasattr(model_config, 'hidden_size'):
+                 raise AttributeError("Model config does not have 'hidden_size' attribute.")
+                 
+            value_head = torch.nn.Linear(model_config.hidden_size, 1)
+            with torch.no_grad():
+                value_head.weight.data.normal_(mean=0.0, std=1/(model_config.hidden_size + 1))
+                value_head.bias.data.zero_()
+            # Use setattr AFTER model preparation if possible, or ensure it's handled correctly by Accelerator
+            # For simplicity here, setting it before, but this might need adjustment depending on deepspeed/FSDP
+            setattr(model, 'value_head', value_head)
+            print("Value head added to the model.")
+        else:
+            print("Value head already exists on the model.")
 
-        # --- Handle PEFT ---
         self.is_peft_model = False
         if peft_config is not None:
              if not is_peft_available(): raise ImportError("PEFT not available.")
+             # Get peft model *before* passing to Trainer's __init__
              model = get_peft_model(model, peft_config)
              self.is_peft_model = True
+             print("PEFT model created.")
 
-        # --- Handle Reference Model Source ---
         self.remote_ref_proxy = None
-        self._ref_model_internal = None # Holds local model before preparation
-        
+        self._ref_model_internal = None
+
         if rft_config.evalulate_state_func is None:
             rft_config.evalulate_state_func = evaluate_state
 
@@ -399,103 +404,170 @@ class RFTTrainer(Trainer):
             except Exception as e: raise ConnectionError(f"Remote ref connection failed: {e}") from e
             if ref_model is not None: print("Warning: Using remote ref, ignoring local `ref_model`.")
         elif self.is_peft_model: print("Using PEFT base model as reference.")
-        elif ref_model is not None: # Local model provided
+        elif ref_model is not None:
             if isinstance(ref_model, str): self._ref_model_internal = AutoModelForCausalLM.from_pretrained(ref_model, **model_kwargs)
             elif isinstance(ref_model, PreTrainedModel): self._ref_model_internal = ref_model
             else: raise TypeError("`ref_model` must be str or PreTrainedModel.")
         else: print("Warning: No reference model configured. KL penalty will be zero.")
 
-        # --- Generation Config ---
         self.generation_config = GenerationConfig(
             max_new_tokens=self.rft_config.response_length, temperature=self.rft_config.temperature + 1e-7,
             top_k=self.rft_config.top_k, top_p=self.rft_config.top_p, do_sample=True,
             repetition_penalty=self.rft_config.repetition_penalty,
-            pad_token_id=processing_class.pad_token_id, eos_token_id=processing_class.eos_token_id,
+            pad_token_id=processing_class.pad_token_id if processing_class.pad_token_id is not None else processing_class.eos_token_id, # Ensure pad_token_id is set
+            eos_token_id=processing_class.eos_token_id,
         )
+        # Add a check for pad_token_id validity
+        if self.generation_config.pad_token_id is None:
+             printc("Warning: pad_token_id is None. Using eos_token_id for padding during generation.", "yellow")
+             self.generation_config.pad_token_id = self.generation_config.eos_token_id
+        if self.generation_config.pad_token_id is None:
+             raise ValueError("Cannot proceed without a valid pad_token_id or eos_token_id in the tokenizer.")
 
-        # --- Default Hook Functions ---
+
         if self.rft_config.critic_prompt_func is None: self.rft_config.critic_prompt_func = get_critic_prompt
         if self.rft_config.process_rewards_func is None: self.rft_config.process_rewards_func = process_rewards
 
-        # --- Data Collator ---
         def data_collator(features): return features
 
-        # --- Call Trainer's __init__ ---
         # Pass the correct argument name (`tokenizer`) to the parent class
+        # Also pass model here, it will be prepared by Trainer.__init__
         super().__init__(
-            model=model,
+            model=model, # Pass the potentially PEFT-wrapped model
             args=rft_config,
             data_collator=data_collator,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
-            processing_class=processing_class,
+            tokenizer=processing_class, # Use 'tokenizer' argument name
             callbacks=callbacks,
             optimizers=optimizers,
             **kwargs
         )
-        # Note: self.tokenizer is now set by the parent Trainer class.
+        # Now self.model is the prepared model (potentially wrapped by Accelerator)
+        # self.tokenizer is set by the parent Trainer
 
         # --- Prepare Local Reference Model ---
         self.ref_model = None
         if self._ref_model_internal is not None:
-            # Ensure ref model dtype matches policy model dtype *before* preparation
-            policy_model_dtype = next(self.model.parameters()).dtype
+            policy_model_dtype = next(self.model.parameters()).dtype # Get dtype from prepared policy model
             if self._ref_model_internal.dtype != policy_model_dtype:
                 print(f"Casting local reference model to {policy_model_dtype} before preparation.")
                 self._ref_model_internal = self._ref_model_internal.to(dtype=policy_model_dtype)
-            # Prepare using accelerator
+            # Prepare using accelerator AFTER Trainer's __init__ has run
             self.ref_model = self.accelerator.prepare_model(self._ref_model_internal, evaluation_mode=True)
             print(f"Local reference model prepared on device: {self.ref_model.device}")
 
-        # --- Final check on value head dtype/device ---
-        # Value head should be prepared along with self.model by super().__init__()
-        if hasattr(self.model, 'value_head'):
-             prepared_model = self.accelerator.unwrap_model(self.model)
-             value_head_dtype = prepared_model.value_head.weight.dtype
-             model_dtype = next(prepared_model.parameters()).dtype
-             if value_head_dtype != model_dtype:
-                 print(f"Casting value head to {model_dtype} post-preparation.")
-                 # Ensure modification happens on the prepared model object
-                 prepared_model.value_head.to(dtype=model_dtype)
-             print(f"Value head attached. Final Dtype: {prepared_model.value_head.weight.dtype}, Device: {prepared_model.value_head.weight.device}")
+        # --- Final check on value head dtype/device after preparation ---
+        # self.model is now the *prepared* model from super().__init__
+        prepared_model_for_check = self.accelerator.unwrap_model(self.model)
+        if hasattr(prepared_model_for_check, 'value_head'):
+             value_head_param = next(iter(prepared_model_for_check.value_head.parameters()))
+             value_head_dtype = value_head_param.dtype
+             value_head_device = value_head_param.device
+             # Get a parameter from the main body of the model to compare
+             # Need to handle PEFT case where base_model holds the main params
+             if self.is_peft_model and hasattr(prepared_model_for_check, 'base_model'):
+                 main_model_param = next(iter(prepared_model_for_check.base_model.model.parameters()))
+             else:
+                 # Attempt to get a parameter, handle potential edge cases
+                 try:
+                     main_model_param = next(iter(p for p in prepared_model_for_check.parameters() if p.requires_grad))
+                 except StopIteration:
+                      printc("Warning: Could not find a main model parameter to check dtype/device against value head.", "yellow")
+                      main_model_param = None # Cannot perform check
 
+             if main_model_param is not None:
+                 model_dtype = main_model_param.dtype
+                 model_device = main_model_param.device # Device check might be less critical if accelerator handled placement
+
+                 if value_head_dtype != model_dtype:
+                     print(f"Warning: Value head dtype ({value_head_dtype}) differs from model body dtype ({model_dtype}). Casting value head.")
+                     # Cast the value head on the *original unwrapped* model object if possible,
+                     # or ensure the prepared object reflects this. This can be tricky with wrappers.
+                     # Direct casting on the unwrapped object is often safer:
+                     prepared_model_for_check.value_head.to(dtype=model_dtype)
+                     # Re-check after casting
+                     value_head_param = next(iter(prepared_model_for_check.value_head.parameters()))
+                     value_head_dtype = value_head_param.dtype
+                     print(f"Value head dtype after casting: {value_head_dtype}")
+
+                 print(f"Value head checked. Final Dtype: {value_head_dtype}, Device: {value_head_device}")
+             else:
+                 print(f"Value head exists but couldn't verify dtype/device against main model. Dtype: {value_head_dtype}, Device: {value_head_device}")
+
+        elif not hasattr(prepared_model_for_check, 'value_head'):
+             printc("Warning: Value head was not found on the *prepared* model. Check initialization and preparation steps.", "red")
 
 
     @contextmanager
     def _optional_no_grad(self, condition: bool):
+        # Helper remains the same
         if condition:
             with torch.no_grad():
                 yield
         else:
             yield
 
-
     def _compute_logprobs_and_states(self, model_instance, input_ids, attention_mask, get_hidden_states: bool):
-        """Internal helper for local model forward pass."""
-        # ... (Implementation remains the same as previous version) ...
+        # Helper remains the same
         if model_instance is None: raise ValueError("_compute_logprobs_and_states called with None.")
         is_ref_computation = (model_instance == self.ref_model) or \
-                             (self.is_peft_model and self.ref_model is None and model_instance == self.model)
+                             (self.is_peft_model and self.ref_model is None and model_instance == self.model) # Comparing prepared instances
         enable_grads = not is_ref_computation
         peft_adapter_manager = nullcontext()
         model_to_use = model_instance
+
+        # When using PEFT base as ref, disable adapter temporarily
         if self.is_peft_model and self.ref_model is None and is_ref_computation:
-             unwrapped_main_model = self.accelerator.unwrap_model(self.model)
-             if hasattr(unwrapped_main_model, 'disable_adapter'): peft_adapter_manager = unwrapped_main_model.disable_adapter()
-             else: printc("PEFT base ref failed: Cannot disable adapter.", "red"); return None, None
+             unwrapped_main_model = self.accelerator.unwrap_model(self.model) # Use the main prepared model
+             if hasattr(unwrapped_main_model, 'disable_adapter'):
+                 peft_adapter_manager = unwrapped_main_model.disable_adapter()
+                 model_to_use = self.model # Use the main model instance, adapter context handles behavior
+             else:
+                 printc("PEFT base ref failed: Cannot disable adapter.", "red"); return None, None
+
+        # Use the context manager for no_grad
         with self._optional_no_grad(not enable_grads), peft_adapter_manager:
-            unwrapped_model = self.accelerator.unwrap_model(model_to_use)
+            # Always unwrap the specific model instance being used (policy or ref)
+            # However, if using PEFT base as ref, we already got the unwrapped main model
+            if not (self.is_peft_model and self.ref_model is None and is_ref_computation):
+                 unwrapped_model = self.accelerator.unwrap_model(model_to_use)
+            else:
+                 unwrapped_model = unwrapped_main_model # Already unwrapped above
+
+            # Check if input tensors are on the same device as the model
+            target_device = next(unwrapped_model.parameters()).device
+            if input_ids.device != target_device:
+                 input_ids = input_ids.to(target_device)
+            if attention_mask.device != target_device:
+                 attention_mask = attention_mask.to(target_device)
+                 
             outputs = unwrapped_model(input_ids, attention_mask=attention_mask, output_hidden_states=get_hidden_states, return_dict=True)
             logits = outputs.logits
-            hidden_states = outputs.hidden_states[-1] if get_hidden_states and outputs.hidden_states else None
+            hidden_states = outputs.hidden_states[-1] if get_hidden_states and outputs.hidden_states else None # Get last layer
+
+        # Ensure logits dtype matches expected float type (e.g., float32) before softmax
+        if logits.dtype not in [torch.float32, torch.float16, torch.bfloat16]:
+             logits = logits.float() # Cast to float32 for stability if needed
+
+        # Shift logits/labels for next token prediction
         shift_logits = logits[:, :-1, :].contiguous()
+
+        # Compute log probabilities
         full_log_probs = F.log_softmax(shift_logits, dim=-1)
+
+        # Ensure the output requires grad if grads were enabled
+        if enable_grads and not full_log_probs.requires_grad:
+            # This case should ideally not happen if input requires grad and ops are differentiable
+            printc("Warning: Logits computed but lost gradient tracking unexpectedly.", "yellow")
+            # Try to re-enable grad if possible? Usually indicates an upstream issue.
+            # full_log_probs = full_log_probs.clone().requires_grad_(True) # Avoid this unless debugging
+
         return full_log_probs, hidden_states
 
 
     def get_ref_log_probs(self, full_input_ids, full_attention_mask):
-        """Computes reference log probabilities using the configured source."""
-        # ... (Implementation remains the same as previous version) ...
+        # Helper remains the same
         if self.remote_ref_proxy is not None:
             if full_input_ids.shape[0] != 1: raise NotImplementedError("Remote ref supports batch size 1 only.")
             try:
@@ -505,45 +577,122 @@ class RFTTrainer(Trainer):
                 return logp_tensor.unsqueeze(0)
             except Exception as e: printc(f"Remote ref failed: {e}", "red"); return None
         elif self.is_peft_model and self.ref_model is None:
+            # Use the main model (which is prepared) but with adapter disabled via _compute_logprobs_and_states
             log_probs, _ = self._compute_logprobs_and_states(self.model, full_input_ids, full_attention_mask, get_hidden_states=False)
             return log_probs
         elif self.ref_model is not None:
+            # Use the prepared reference model
             log_probs, _ = self._compute_logprobs_and_states(self.ref_model, full_input_ids, full_attention_mask, get_hidden_states=False)
             return log_probs
-        else: return None
-
+        else: return None # No reference model configured
 
     def get_full_kl_divergence(self, full_policy_log_probs, full_ref_log_probs, full_input_ids):
-        """Calculates per-token KL divergence for the entire sequence."""
-        # ... (Implementation remains the same as previous version) ...
+        # Helper remains the same
         if full_ref_log_probs is None or full_policy_log_probs is None: return None
-        if full_input_ids.shape[1] <= 1: return None
-        if full_policy_log_probs.shape[1] != full_input_ids.shape[1] - 1 or full_ref_log_probs.shape[1] != full_input_ids.shape[1] - 1:
-             printc(f"Shape mismatch KL calc", "red"); return None
-        actual_next_tokens_indices = full_input_ids[:, 1:].contiguous().unsqueeze(-1)
-        policy_token_log_probs = torch.gather(full_policy_log_probs, -1, actual_next_tokens_indices).squeeze(-1)
-        ref_token_log_probs = torch.gather(full_ref_log_probs, -1, actual_next_tokens_indices).squeeze(-1)
-        return torch.clamp(policy_token_log_probs - ref_token_log_probs, min=-30, max=30)
+        if full_input_ids.shape[1] <= 1: return None # Need at least 2 tokens for KL calculation (shifted)
+
+        # Check shapes carefully - log probs are shifted (L-1)
+        expected_len = full_input_ids.shape[1] - 1
+        if full_policy_log_probs.shape[1] != expected_len or full_ref_log_probs.shape[1] != expected_len:
+             printc(f"Shape mismatch KL calc: policy_logp={full_policy_log_probs.shape}, ref_logp={full_ref_log_probs.shape}, expected_len={expected_len}", "red")
+             return None
+
+        # Get actual next tokens (indices) - shape (B, L-1)
+        actual_next_tokens_indices = full_input_ids[:, 1:].contiguous()
+
+        # Ensure indices are within vocab bounds for gathering
+        vocab_size = full_policy_log_probs.shape[-1]
+        if actual_next_tokens_indices.max() >= vocab_size or actual_next_tokens_indices.min() < 0:
+            printc(f"Invalid indices for KL gather: min={actual_next_tokens_indices.min()}, max={actual_next_tokens_indices.max()}, vocab_size={vocab_size}", "red")
+            # Handle invalid indices (e.g., clamp or return None) - Returning None is safer
+            return None
+
+        # Gather the log_probs for the actual tokens generated
+        # Add unsqueeze(-1) for gather dimension, then squeeze(-1)
+        policy_token_log_probs = torch.gather(full_policy_log_probs, -1, actual_next_tokens_indices.unsqueeze(-1)).squeeze(-1)
+        ref_token_log_probs = torch.gather(full_ref_log_probs, -1, actual_next_tokens_indices.unsqueeze(-1)).squeeze(-1)
+
+        # KL divergence: policy_logp(token) - ref_logp(token)
+        # Clamp to avoid large values if needed
+        kl_div = torch.clamp(policy_token_log_probs - ref_token_log_probs.detach(), min=-30, max=30) # Detach ref_log_probs as we don't backprop through ref model
+
+        return kl_div # Shape should be (B, L-1)
+
 
     def extract_step_values(self, full_sequence_tensor, full_input_ids, step_input_ids):
-        """Utility to extract values corresponding to a step from a SHIFTED sequence tensor."""
-        # ... (Implementation remains the same as previous version, maybe add more shape checks) ...
-        if full_sequence_tensor is None or step_input_ids is None or step_input_ids.shape[1] == 0: return None
-        seq_len, step_len = full_input_ids.shape[1], step_input_ids.shape[1]
-        start_idx = seq_len - step_len - 1; end_idx = seq_len - 1
-        if start_idx < 0 or start_idx >= full_sequence_tensor.shape[1]: return None
-        end_idx = min(end_idx, full_sequence_tensor.shape[1])
+        # Helper remains the same, added more verbose checks
+        if full_sequence_tensor is None or step_input_ids is None or step_input_ids.shape[1 == 0]:
+            # printc("Extract step values: Invalid input (None or empty step).", "grey")
+            return None
+
+        batch_size, seq_len = full_input_ids.shape
+        step_len = step_input_ids.shape[1]
+
+        # full_sequence_tensor is typically SHIFTED (log_probs or KL), so its length is seq_len - 1
+        full_tensor_len = full_sequence_tensor.shape[1]
+        if full_tensor_len != seq_len - 1:
+                # This might happen if generation stopped early, but should be handled carefully
+                printc(f"Extract step values: Warning - full tensor len ({full_tensor_len}) != seq_len-1 ({seq_len-1}).", "yellow")
+                # Adjust seq_len based on the tensor we actually have? Or assume error?
+                # Let's assume the tensor length is the source of truth for slicing
+                seq_len = full_tensor_len + 1 # Implied sequence length based on tensor
+                if seq_len <= step_len : # Cannot extract if total length is not greater than step length
+                    printc(f"Extract step values: Cannot extract, adjusted seq_len ({seq_len}) <= step_len ({step_len}).", "red")
+                    return None
+
+
+        # Calculate start/end index in the SHIFTED tensor (length seq_len - 1)
+        # The slice corresponds to the predictions for step_input_ids tokens
+        # Example: full = [t1, t2, t3, t4, t5], step = [s1, s2] (tokens t4, t5)
+        # Logprobs correspond to preds for t2, t3, t4, t5. Length 4. seq_len = 5
+        # We want logprobs corresponding to step tokens s1, s2 (which are t4, t5)
+        # These are at indices 2 and 3 in the logprob tensor.
+        # start_idx = (seq_len - 1) - step_len = 4 - 2 = 2
+        # end_idx = (seq_len - 1) = 4
+        start_idx = full_tensor_len - step_len
+        end_idx = full_tensor_len # Exclusive end index
+
+        # Basic boundary checks
+        if start_idx < 0 or start_idx >= full_tensor_len:
+            printc(f"Extract step values: Invalid start index {start_idx} for tensor length {full_tensor_len}.", "red")
+            return None
+        # end_idx is naturally <= full_tensor_len
+
         slice_len = end_idx - start_idx
-        if slice_len <=0: return None
+        if slice_len <= 0:
+             printc(f"Extract step values: Invalid slice length {slice_len}.", "red")
+             return None
+
         try:
-            if len(full_sequence_tensor.shape) == 3: step_values = full_sequence_tensor[:, start_idx:end_idx, :]
-            elif len(full_sequence_tensor.shape) == 2: step_values = full_sequence_tensor[:, start_idx:end_idx]
-            else: return None
-        except IndexError: return None
-        if step_values.shape[1] != step_len: pass # Allow shorter slice due to generation end
+            # Slice based on tensor dimension
+            if len(full_sequence_tensor.shape) == 3: # (B, L-1, V) -> Log Probs Dist
+                step_values = full_sequence_tensor[:, start_idx:end_idx, :]
+            elif len(full_sequence_tensor.shape) == 2: # (B, L-1) -> KL Div per token
+                step_values = full_sequence_tensor[:, start_idx:end_idx]
+            else:
+                printc(f"Extract step values: Unexpected tensor dimension {len(full_sequence_tensor.shape)}.", "red")
+                return None
+        except IndexError as e:
+            printc(f"Extract step values: Slicing error - {e}. Indices: {start_idx}:{end_idx}, Shape: {full_sequence_tensor.shape}", "red")
+            return None
+
+        # Check if the extracted slice length matches the expected step length
+        # It might be shorter if the original generation was shorter than max_length + step_length
+        if step_values.shape[1] != step_len:
+            # printc(f"Extract step values: Warning - Extracted slice length ({step_values.shape[1]}) != step token length ({step_len}). May happen if generation ended early.", "grey")
+            # This is often acceptable, the loss calculation needs to handle potentially shorter sequences.
+            pass # Allow shorter slice
+
+        if step_values.shape[1] == 0:
+             # printc("Extract step values: Resulting slice is empty.", "grey")
+             return None # Return None if slice ended up empty
+
         return step_values
 
 
+    # ==================================
+    # ===== REWRITTEN TRAIN FUNCTION =====
+    # ==================================
     def train(self, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None, **kwargs):
         """Main training loop for RFT. With robust error handling and grad checks."""
 
@@ -551,108 +700,182 @@ class RFTTrainer(Trainer):
         device = self.accelerator.device
         optimizer = self.optimizer
         lr_scheduler = self.lr_scheduler
-        tokenizer = self.processing_class
-        model = self.model
+        tokenizer = self.tokenizer # Use self.tokenizer set by parent Trainer
+        model = self.model         # Use self.model prepared by parent Trainer
 
-        unwrapped_model_for_config = self.accelerator.unwrap_model(model)
-        if not hasattr(unwrapped_model_for_config, 'config') or not hasattr(unwrapped_model_for_config.config, 'vocab_size'):
-             raise ValueError("Could not determine model vocabulary size.")
-        model_vocab_size = unwrapped_model_for_config.config.vocab_size
-        print(f"Using Model Vocab Size: {model_vocab_size}")
+        if tokenizer is None:
+            raise ValueError("Tokenizer (self.tokenizer) is not set. Check RFTTrainer initialization.")
+
+        # Determine vocab size safely
+        try:
+            # Unwrap the model to get the base config, handle PEFT potentially
+            unwrapped_model_for_config = self.accelerator.unwrap_model(model)
+            if self.is_peft_model and hasattr(unwrapped_model_for_config, 'base_model'):
+                 model_config = unwrapped_model_for_config.base_model.model.config
+            else:
+                 model_config = unwrapped_model_for_config.config
+            model_vocab_size = model_config.vocab_size
+            print(f"Using Model Vocab Size: {model_vocab_size}")
+        except AttributeError as e:
+            raise ValueError(f"Could not determine model vocabulary size from config: {e}")
+
 
         if optimizer is None: raise ValueError("Optimizer is None.")
         try:
-            if not list(optimizer.param_groups[0]['params']):
-                 raise ValueError("Optimizer parameter list is empty.")
-            print(f"Optimizer has {len(list(optimizer.param_groups[0]['params']))} parameter tensors.")
-        except IndexError:
-             raise ValueError("Optimizer.param_groups is empty or invalid.")
+            # Check if optimizer has parameters assigned to it
+            if not any(len(pg['params']) > 0 for pg in optimizer.param_groups):
+                 raise ValueError("Optimizer parameter list is empty or all parameter groups are empty.")
+            num_param_tensors = sum(len(pg['params']) for pg in optimizer.param_groups)
+            print(f"Optimizer has {num_param_tensors} parameter tensors across {len(optimizer.param_groups)} groups.")
+        except Exception as e: # Catch broader issues like invalid optimizer state
+             raise ValueError(f"Optimizer check failed: {e}")
 
 
-        model.train()
+        model.train() # Ensure model is in training mode
         train_dataloader = self.get_train_dataloader()
         if train_dataloader is None:
-            raise ValueError("No train dataloader found. train_dataset may be None.")
+            raise ValueError("No train dataloader found. train_dataset may be None or empty.")
 
-        # Calculate num_update_steps_per_epoch robustly
-        if hasattr(train_dataloader, 'batch_sampler') and train_dataloader.batch_sampler is not None:
-            len_dataloader = len(train_dataloader.batch_sampler)
-        elif hasattr(train_dataloader, '__len__'):
+        # Calculate num_update_steps_per_epoch robustly (essential for scheduler and logging)
+        try:
             len_dataloader = len(train_dataloader)
+        except TypeError: # Handle IterableDataset case
+            printc("Warning: Could not determine dataloader length (likely IterableDataset). Estimating based on args.max_steps if provided, otherwise scheduler/logging steps might be inaccurate.", "yellow")
+            if self.args.max_steps > 0:
+                # Estimate based on max_steps, epochs, and accumulation. This isn't perfect.
+                num_train_epochs = int(self.rft_config.num_train_epochs) if self.rft_config.num_train_epochs > 0 else 1
+                len_dataloader = (self.args.max_steps * self.rft_config.gradient_accumulation_steps) // num_train_epochs
+                if len_dataloader == 0: len_dataloader = 1 # Avoid division by zero
+                print(f"Estimated dataloader length: {len_dataloader} based on max_steps")
+            else:
+                # Cannot determine length, use a large placeholder or default, TQDM might not work
+                len_dataloader = None # Indicate unknown length
+                printc("Cannot estimate dataloader length. Progress bar and exact epoch counts may be unavailable.", "yellow")
+
+
+        if len_dataloader is not None:
+            num_update_steps_per_epoch = len_dataloader // self.rft_config.gradient_accumulation_steps
+            num_train_epochs = int(self.rft_config.num_train_epochs)
+            # Calculate max_steps based on epochs * steps_per_epoch if not provided
+            if self.args.max_steps <= 0:
+                max_steps = num_update_steps_per_epoch * num_train_epochs
+                print(f"Calculated max_steps: {max_steps}")
+            else:
+                # If max_steps is provided, it overrides the calculation based on epochs
+                max_steps = self.args.max_steps
+                # Adjust num_train_epochs based on max_steps if necessary for accurate epoch reporting
+                num_train_epochs = math.ceil(max_steps / num_update_steps_per_epoch) if num_update_steps_per_epoch > 0 else 1
+                print(f"Using provided max_steps: {max_steps}. Adjusted num_epochs for reporting: {num_train_epochs}")
         else:
-             # Cannot determine length, set a large number or estimate if absolutely necessary
-             printc("Warning: Could not determine dataloader length. Scheduler steps might be inaccurate.", "yellow")
-             # Fallback: estimate based on dataset length if available
-             if hasattr(self.train_dataset, '__len__'):
-                 len_dataloader = (len(self.train_dataset) + self.args.train_batch_size -1) // self.args.train_batch_size
-             else:
-                 len_dataloader = 10000 # Arbitrary large number if dataset length also unknown
+             # Handle unknown dataloader length
+             if self.args.max_steps <= 0:
+                  raise ValueError("Cannot determine training steps. Provide args.max_steps when using IterableDataset without a defined length.")
+             max_steps = self.args.max_steps
+             num_update_steps_per_epoch = max_steps # Treat as one long epoch if length unknown
+             num_train_epochs = 1 # Only one epoch in this view
+             print(f"Using provided max_steps: {max_steps} with unknown dataloader length.")
 
-        num_update_steps_per_epoch = len_dataloader // self.rft_config.gradient_accumulation_steps
-        num_train_epochs = int(self.rft_config.num_train_epochs)
-        max_steps = num_update_steps_per_epoch * num_train_epochs
-        num_train_optimization_steps = max_steps # Use calculated max_steps
 
-        print(f"Dataloader length (batches): {len_dataloader}")
+        # Ensure max_steps is correctly set in Trainer state if not already done by super().__init__
+        self.state.max_steps = max_steps
+        num_train_optimization_steps = max_steps # Total optimizer steps
+
+        print(f"Dataloader length (batches): {'Unknown' if len_dataloader is None else len_dataloader}")
         print(f"Num Epochs: {num_train_epochs}")
         print(f"Gradient Accumulation Steps: {self.rft_config.gradient_accumulation_steps}")
-        print(f"Updates per Epoch: {num_update_steps_per_epoch}")
+        print(f"Updates per Epoch: {'Unknown' if len_dataloader is None else num_update_steps_per_epoch}")
         print(f"Total optimization steps: {num_train_optimization_steps}")
 
-
-        # Initialize state if needed
+        # --- Initialize TrainerState and TrainerControl ---
+        # This is usually handled by Trainer's internal _maybe_log_save_evaluate methods etc.
+        # but ensuring they exist early might help callbacks.
         if self.state is None:
             from transformers.trainer_utils import TrainerState
             self.state = TrainerState()
         if resume_from_checkpoint is None:
-             self.state.global_step = 0
+            self.state.global_step = 0 # Start from step 0 if not resuming
         else:
-             # Add logic to load state from checkpoint if needed
-             pass
+            # Add logic here if resuming checkpoint loading affects global_step
+            pass
 
-        # Initialize control object if needed (often handled by callback_handler)
         if self.control is None:
              from transformers.trainer_utils import TrainerControl
              self.control = TrainerControl()
-             
-        # Initialize Callback Handler if needed (critical for progress bar logic)
+
+        # --- Initialize Callback Handler ---
+        # Crucial for logging, progress bars, and other integrations.
+        # Re-instantiating it or ensuring it's properly configured if it was set to None.
         if self.callback_handler is None:
              from transformers.trainer_callback import CallbackHandler, DefaultFlowCallback, PrinterCallback, ProgressCallback
-             # Use default callbacks appropriate for the environment
+             # Get default callbacks, including ones for integrations like WandB, TensorBoard
+             from transformers.integrations import get_reporting_integration_callbacks
+             default_callbacks = [DefaultFlowCallback] + get_reporting_integration_callbacks(self.args.report_to)
+             # Add progress callback if TQDM is enabled
+             if not self.args.disable_tqdm and self.is_local_process_zero():
+                 try:
+                     # Try importing ProgressCallback which uses TQDM
+                     from transformers.trainer_callback import ProgressCallback
+                     default_callbacks.append(ProgressCallback)
+                 except ImportError:
+                     # Fallback to PrinterCallback if TQDM is not available/broken
+                     printc("TQDM ProgressCallback not available or disabled, using PrinterCallback.", "yellow")
+                     default_callbacks.append(PrinterCallback)
+             elif self.is_local_process_zero():
+                  # If TQDM disabled but we are main process, add PrinterCallback for basic step output
+                  default_callbacks.append(PrinterCallback)
+
+
              self.callback_handler = CallbackHandler(
-                 callbacks=[DefaultFlowCallback], # Add PrinterCallback or ProgressCallback if needed and TQDM available
+                 callbacks=default_callbacks + (self.callbacks), # Combine default and user callbacks
                  model=self.model,
                  tokenizer=self.tokenizer,
                  optimizer=self.optimizer,
                  lr_scheduler=self.lr_scheduler,
              )
-             # Add progress bar callback only if TQDM is likely available/enabled
-             # This might help avoid the NoneType error but depends on base Trainer setup
-             if not self.args.disable_tqdm:
-                 try:
-                     from transformers.integrations import get_reporting_integration_callbacks
-                     # Check if PrinterCallback or ProgressCallback should be added based on env
-                     # This logic is simplified here; Trainer base class handles it more complexly
-                     # Forcing PrinterCallback might be safer if ProgressCallback causes issues
-                     self.callback_handler.callbacks.append(PrinterCallback) 
-                     print("Added PrinterCallback manually (TQDM handling might differ from base Trainer).")
-                 except ImportError:
-                      printc("TQDM not found or disabled, progress bar callback not added.", "yellow")
+             print("Callback handler initialized.")
 
 
+        # --- Trigger Train Begin Callback ---
         self.callback_handler.on_train_begin(self.args, self.state, self.control)
 
         # --- Training Loop ---
+        global_step_for_loop = self.state.global_step # Track steps for max_steps condition
+
         for epoch in range(num_train_epochs):
             printc(f"Starting Epoch {epoch+1}/{num_train_epochs}", "yellow")
             self.control = self.callback_handler.on_epoch_begin(self.args, self.state, self.control)
 
             # --- Batch Loop ---
-            for train_step, batch in enumerate(train_dataloader):
+            # Use enumerate(train_dataloader) for step counting within epoch
+            # If len_dataloader is None (IterableDataset), this just runs until dataset exhausted or max_steps hit
+            batch_iterator = iter(train_dataloader)
+            current_epoch_step = 0
+            while True: # Loop until break condition (dataset end or max_steps)
+
+                # Check max_steps condition FIRST
+                if max_steps > 0 and global_step_for_loop >= max_steps:
+                    printc(f"Reached max_steps ({max_steps}). Stopping training.", "yellow")
+                    self.control.should_training_stop = True
+                    break # Exit inner batch loop
+
+                # Get next batch, handle end of dataset
+                try:
+                    batch = next(batch_iterator)
+                    # Move batch to device if it's a tensor or dict of tensors (handled by default Trainer Dataloader usually)
+                    # If using custom collate_fn, might need manual moving here. Assuming simple list for now.
+                except StopIteration:
+                    printc(f"End of dataloader reached for epoch {epoch+1}.", "blue")
+                    break # Exit inner batch loop, go to next epoch
+
+                # Increment step counter for the current epoch
+                current_epoch_step += 1
+                # Actual step number considering accumulation starts from 1 for logging/callbacks
+                train_step_display = self.state.global_step * self.rft_config.gradient_accumulation_steps + (current_epoch_step % self.rft_config.gradient_accumulation_steps)
+
 
                 self.control = self.callback_handler.on_step_begin(self.args, self.state, self.control)
 
-                # Initialize variables used across try/except blocks
+                # Initialize variables used across try/except blocks for this item/batch
                 prompt_completion_ids = None
                 full_policy_log_probs = None
                 full_hidden_states = None
@@ -664,17 +887,32 @@ class RFTTrainer(Trainer):
                 log_total_loss = 0.0; log_policy_loss = 0.0; log_kl_loss = 0.0; log_value_loss = 0.0
 
 
-                # --- Item Processing Block ---
+                # --- Item Processing Block (using batch[0] as before) ---
                 try:
                     # --- 1 & 2. Prompt Setup & Validation ---
-                    if not isinstance(batch, list) or not batch: continue
+                    if not isinstance(batch, list) or not batch:
+                         printc(f"Skipping empty or invalid batch at step {train_step_display}", "grey")
+                         continue
+                    # Assuming batch contains list of dicts, process first item
                     batch_item = batch[0]
+                    if not isinstance(batch_item, dict):
+                        printc(f"Skipping invalid batch item (not a dict) at step {train_step_display}", "grey")
+                        continue
 
-                    question = batch_item[self.rft_config.question]
-                    solution = batch_item[self.rft_config.answer]
+                    # Safely get question and solution
+                    question = batch_item.get(self.rft_config.question)
+                    solution = batch_item.get(self.rft_config.answer)
+                    if question is None or solution is None:
+                        printc(f"Skipping batch item due to missing '{self.rft_config.question}' or '{self.rft_config.answer}' key at step {train_step_display}", "yellow")
+                        continue
+
                     messages = [{'role': 'user', 'content': self.rft_config.system_prompt + question}]
-                    q_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                    q_text += self.rft_config.b_think
+                    try:
+                         q_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                         q_text += self.rft_config.b_think
+                    except Exception as e:
+                         printc(f"Error applying chat template at step {train_step_display}: {e}", "red")
+                         continue # Skip item if template fails
 
                     prompt_tokens_dict = tokenizer(
                         q_text, return_tensors="pt", padding=False, add_special_tokens=True,
@@ -682,250 +920,489 @@ class RFTTrainer(Trainer):
                     )
 
                     input_ids_cpu = prompt_tokens_dict["input_ids"]
+                    if input_ids_cpu.numel() == 0:
+                         printc(f"ERROR: Empty prompt after tokenization at step {train_step_display}!", "red"); continue
                     min_id, max_id = input_ids_cpu.min().item(), input_ids_cpu.max().item()
                     if min_id < 0 or max_id >= model_vocab_size:
-                        printc(f"ERROR: Invalid initial prompt IDs item {train_step}!", "red"); continue
+                        printc(f"ERROR: Invalid initial prompt token IDs (min={min_id}, max={max_id}) at step {train_step_display}!", "red"); continue
 
                     prompt_tokens = {k: v.to(device) for k, v in prompt_tokens_dict.items()}
                     prompt_length = prompt_tokens["input_ids"].size(1)
 
 
                     # --- 3. Generate full completion ---
-                    # Wrap generation in its own try/except to isolate failures
                     try:
-                        with torch.no_grad():
+                        # Ensure generation config pad_token_id is valid
+                        current_pad_id = self.generation_config.pad_token_id
+                        if current_pad_id is None or current_pad_id < 0 or current_pad_id >= model_vocab_size:
+                            safe_pad_id = tokenizer.eos_token_id
+                            if safe_pad_id is None or safe_pad_id < 0 or safe_pad_id >= model_vocab_size:
+                                raise ValueError(f"Cannot generate: Invalid pad_token_id ({current_pad_id}) and invalid EOS token ({tokenizer.eos_token_id})")
+                            printc(f"Warning: Invalid pad_token_id ({current_pad_id}). Using EOS token ({safe_pad_id}) for padding during generation.", "yellow")
+                            self.generation_config.pad_token_id = safe_pad_id
+
+                        with torch.no_grad(): # Generation should not track gradients
                             unwrapped_model = self.accelerator.unwrap_model(model)
-                            model_device = unwrapped_model.device
+                            model_device = unwrapped_model.device # Get device from actual model
+                            # Ensure inputs are on the model's device for generate
                             prompt_tokens_model_device = {k: v.to(model_device) for k, v in prompt_tokens.items()}
-                            if self.generation_config.pad_token_id is None or self.generation_config.pad_token_id < 0 or self.generation_config.pad_token_id >= model_vocab_size:
-                                 safe_pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None and 0 <= tokenizer.eos_token_id < model_vocab_size else -1
-                                 if safe_pad_id != -1: self.generation_config.pad_token_id = safe_pad_id
-                                 else: raise ValueError(f"Invalid pad_token_id ({self.generation_config.pad_token_id})")
 
                             # *** Assign prompt_completion_ids here ***
                             prompt_completion_ids = unwrapped_model.generate(
-                                **prompt_tokens_model_device, generation_config=self.generation_config,
+                                **prompt_tokens_model_device,
+                                generation_config=self.generation_config,
+                                # Return dict is useful for debugging if needed, but sequence is primary output
+                                # return_dict_in_generate=True, output_scores=True # Optional for debug
                             )
 
+                            # Validate generated IDs
+                            if prompt_completion_ids.numel() == 0:
+                                printc(f"ERROR: Generation produced empty output at step {train_step_display}!", "red"); continue
                             min_gen_id, max_gen_id = prompt_completion_ids.min().item(), prompt_completion_ids.max().item()
                             if min_gen_id < 0 or max_gen_id >= model_vocab_size:
-                                 printc(f"ERROR: Invalid generated IDs item {train_step}!", "red"); continue # Skip to next item
+                                 printc(f"ERROR: Invalid generated token IDs (min={min_gen_id}, max={max_gen_id}) at step {train_step_display}!", "red"); continue # Skip to next item
 
                     except Exception as gen_e:
-                        printc(f"Generation failed item {train_step}: {gen_e}", "red")
-                        # Ensure we skip the rest of the processing for this item
+                        printc(f"Generation failed for item at step {train_step_display}: {gen_e}", "red")
                         continue # Go to the next item in the dataloader
 
-                    # --- Move generated IDs and create mask ---
+                    # --- Move generated IDs to accelerator default device and create mask ---
                     prompt_completion_ids = prompt_completion_ids.to(device)
                     full_generated_attention_mask = torch.ones_like(prompt_completion_ids, device=device)
+                    if prompt_completion_ids.shape[1] <= 1:
+                        printc(f"Skipping item {train_step_display}: generated sequence too short (<=1 token).", "yellow"); continue
 
 
                     # --- Compute full logprobs and KL ---
-                    # This block is now entered ONLY if generation succeeded
+                    # This block is now entered ONLY if generation succeeded and sequence is long enough
                     full_policy_log_probs, full_hidden_states = self._compute_logprobs_and_states(
                         model, prompt_completion_ids, full_generated_attention_mask, get_hidden_states=True
                     )
-                    if full_policy_log_probs is None:
-                         printc(f"Policy forward pass failed item {train_step}. Skipping.", "yellow"); continue
-                    if not full_policy_log_probs.requires_grad:
-                         printc(f"FATAL: full_policy_log_probs NO grad item {train_step}", "red"); continue
 
+                    # ***** THE CRITICAL CHECK *****
+                    if full_policy_log_probs is None:
+                         printc(f"Policy forward pass failed (returned None) item {train_step_display}. Skipping.", "red"); continue
+                    if not full_policy_log_probs.requires_grad:
+                         printc(f"FATAL: full_policy_log_probs NO grad item {train_step_display}. Skipping batch item.", "red")
+                         # Potentially log more context here: model state, input shapes etc.
+                         continue # Skip to the next item in the batch/dataloader
+
+                    # Compute reference log probs only if policy forward pass succeeded
                     full_ref_log_probs = self.get_ref_log_probs(prompt_completion_ids, full_generated_attention_mask)
+                    # Compute KL divergence (will be None if ref log probs are None)
                     full_per_token_kl = self.get_full_kl_divergence(full_policy_log_probs, full_ref_log_probs, prompt_completion_ids)
 
 
                     # --- 4, 5, 6. Decode, Split CoT, Split Steps ---
                     completion_ids = prompt_completion_ids[:, prompt_length:]
-                    if completion_ids.shape[1] == 0: continue
+                    if completion_ids.shape[1] == 0:
+                        printc(f"Skipping item {train_step_display}: No completion tokens generated.", "yellow"); continue
+                    # Basic validation on completion IDs
                     min_comp_id, max_comp_id = completion_ids.min().item(), completion_ids.max().item()
-                    if min_comp_id < 0 or max_comp_id >= model_vocab_size: continue
-                    full_text = tokenizer.decode(completion_ids[0], skip_special_tokens=True, clean_up_tokenization_spaces=True)
+                    if min_comp_id < 0 or max_comp_id >= model_vocab_size:
+                        printc(f"ERROR: Invalid completion token IDs (min={min_comp_id}, max={max_comp_id}) at step {train_step_display}!", "red"); continue
+
+                    try:
+                        full_text = tokenizer.decode(completion_ids[0], skip_special_tokens=True, clean_up_tokenization_spaces=True)
+                    except Exception as decode_e:
+                         printc(f"Error decoding completion at step {train_step_display}: {decode_e}", "red"); continue
+
                     split_result = full_text.split(self.rft_config.e_think, 1)
                     if len(split_result) >= 2: cot, answer = split_result[0].strip(), split_result[1].strip()
-                    else: cot, answer = split_result[0].strip(), self.rft_config.answer_default
+                    else: cot, answer = split_result[0].strip(), self.rft_config.answer_default # Use default if no split
+
+                    if not cot: # Handle empty CoT after stripping
+                         printc(f"Skipping item {train_step_display}: Empty Chain-of-Thought after splitting.", "yellow"); continue
+
                     steps_text_raw = split_cot(cot, self.rft_config.delimiter)
-                    if not steps_text_raw: continue
+                    if not steps_text_raw:
+                         printc(f"Skipping item {train_step_display}: No steps found after splitting CoT.", "yellow"); continue
 
 
                     # --- 7. Evaluate rewards & Whiten ---
                     cumulative_reasons = [{f"thought_{i}": txt} for i, txt in enumerate(steps_text_raw)]
                     critic_prompt = self.rft_config.critic_prompt_func(question, cumulative_reasons, answer, solution)
-                    eval_data = self.rft_config.evalulate_state_func(critic_prompt, cumulative_reasons)
-                    if eval_data is None or 'steps' not in eval_data or not eval_data['steps']: continue
-                    steps_data = self.rft_config.process_rewards_func(eval_data.get("overall_score", 0), eval_data['steps'], self.rft_config)
-                    if not steps_data: continue
+
+                    try: # Wrap external evaluation call
+                        eval_data = self.rft_config.evalulate_state_func(critic_prompt, cumulative_reasons)
+                    except Exception as eval_e:
+                        printc(f"Error during state evaluation call at step {train_step_display}: {eval_e}", "red")
+                        continue # Skip item if evaluation fails
+
+                    if eval_data is None or 'steps' not in eval_data or not eval_data['steps']:
+                         printc(f"Skipping item {train_step_display}: Invalid or empty evaluation data received.", "yellow"); continue
+
+                    try: # Wrap reward processing
+                        steps_data = self.rft_config.process_rewards_func(eval_data.get("overall_score", 0), eval_data['steps'], self.rft_config)
+                    except Exception as reward_proc_e:
+                        printc(f"Error during reward processing call at step {train_step_display}: {reward_proc_e}", "red")
+                        continue # Skip item if processing fails
+
+                    if not steps_data:
+                         printc(f"Skipping item {train_step_display}: No step data after reward processing.", "yellow"); continue
+
+                    # --- Whiten Rewards (if enabled) ---
                     if self.rft_config.whiten_rewards and len(steps_data) > 0:
-                        # (Whitening logic as before)
-                        all_rewards = torch.tensor([s['combined_score'] for s in steps_data if 'combined_score' in s], device=device, dtype=torch.float32)
-                        if len(all_rewards) > 1: 
-                            mean, std = all_rewards.mean(), all_rewards.std(); whitened = (all_rewards - mean) / (std + 1e-8) if std > 1e-5 else (all_rewards - mean)
-                        elif len(all_rewards) == 1: whitened = all_rewards - all_rewards.mean()
-                        else: whitened = torch.tensor([], device=device, dtype=torch.float32) 
-                        score_idx = 0
-                        for i in range(len(steps_data)):
-                            if 'combined_score' in steps_data[i] and score_idx < len(whitened):
-                                w_score = whitened[score_idx].item()
-                                if not (torch.isnan(torch.tensor(w_score)) or torch.isinf(torch.tensor(w_score))): steps_data[i]['whitened_score'] = w_score
-                                score_idx += 1
+                        try:
+                            all_rewards = torch.tensor([s['combined_score'] for s in steps_data if 'combined_score' in s], device=device, dtype=torch.float32)
+                            if all_rewards.numel() > 1:
+                                mean, std = all_rewards.mean(), all_rewards.std()
+                                # Prevent division by zero or very small std dev
+                                whitened = (all_rewards - mean) / (std + 1e-8) if std > 1e-5 else (all_rewards - mean)
+                            elif all_rewards.numel() == 1:
+                                whitened = all_rewards - all_rewards.mean() # Center single reward
+                            else:
+                                whitened = torch.tensor([], device=device, dtype=torch.float32) # Empty if no valid scores
+
+                            # Add whitened scores back, checking for NaN/Inf from whitening
+                            score_idx = 0
+                            for i in range(len(steps_data)):
+                                if 'combined_score' in steps_data[i] and score_idx < len(whitened):
+                                    w_score_tensor = whitened[score_idx]
+                                    if not (torch.isnan(w_score_tensor) or torch.isinf(w_score_tensor)):
+                                        steps_data[i]['whitened_score'] = w_score_tensor.item()
+                                    else:
+                                        printc(f"Warning: NaN/Inf detected in whitened score for step {i} at train_step {train_step_display}. Skipping whitening for this step.", "yellow")
+                                        # Optionally fall back to combined_score or zero?
+                                        # steps_data[i]['whitened_score'] = steps_data[i]['combined_score'] # Fallback option
+                                    score_idx += 1
+                        except Exception as whiten_e:
+                             printc(f"Error during reward whitening at step {train_step_display}: {whiten_e}", "red")
+                             # Decide whether to continue without whitening or skip item
+                             continue # Skip item is safer if whitening fails badly
 
 
                     # --- 8. Accumulate Losses Over Steps ---
                     all_policy_loss_terms, all_kl_loss_terms, all_value_losses = [], [], []
                     total_steps_len_tokens = 0
-                    gradient_lost_in_loop = False 
+                    gradient_lost_in_loop = False # Reset flag for this item
 
                     for step_idx, step_info in enumerate(steps_data):
-                        if gradient_lost_in_loop: break
+                        if gradient_lost_in_loop:
+                            printc(f"Gradient lost in previous step, skipping remaining steps for item {train_step_display}", "yellow")
+                            break # Stop processing steps for this item if gradient was lost
+
                         try:
-                            # (Same step processing logic with grad checks as previous refined version)
-                            reward_key = 'whitened_score' if self.rft_config.whiten_rewards and 'whitened_score' in step_info else 'combined_score'; # ... reward setup ...
-                            if reward_key not in step_info: continue
+                            # --- Determine reward ---
+                            reward_key = 'whitened_score' if self.rft_config.whiten_rewards and 'whitened_score' in step_info else 'combined_score'
+                            if reward_key not in step_info:
+                                printc(f"Skipping step {step_idx} (missing reward key '{reward_key}') at train_step {train_step_display}", "grey")
+                                continue
                             step_reward = step_info[reward_key]
-                            if torch.isnan(torch.tensor(step_reward)) or torch.isinf(torch.tensor(step_reward)): step_reward = 0.0
+                            # Validate reward value
+                            if torch.isnan(torch.tensor(step_reward)) or torch.isinf(torch.tensor(step_reward)):
+                                printc(f"Warning: NaN/Inf reward found for step {step_idx} at train_step {train_step_display}. Using 0.0.", "yellow")
+                                step_reward = 0.0
                             step_reward_tensor = torch.tensor(step_reward, device=device, dtype=torch.float32)
 
-                            step_tokenized = tokenizer(step_info["txt"], return_tensors="pt", padding=False, add_special_tokens=False); # ... token validation ...
-                            step_input_ids = step_tokenized['input_ids'].to(device) 
-                            if step_input_ids.shape[1] == 0: continue 
+                            # --- Tokenize Step & Validate ---
+                            step_text = step_info.get("txt")
+                            if not step_text:
+                                 printc(f"Skipping step {step_idx} (empty text) at train_step {train_step_display}", "grey")
+                                 continue
+                            step_tokenized = tokenizer(step_text, return_tensors="pt", padding=False, add_special_tokens=False)
+                            step_input_ids = step_tokenized['input_ids'].to(device)
+
+                            if step_input_ids.shape[1] == 0:
+                                printc(f"Skipping step {step_idx} (empty after tokenization) at train_step {train_step_display}", "grey")
+                                continue # Skip if step tokenization results in empty tensor
+
                             min_step_id, max_step_id = step_input_ids.min().item(), step_input_ids.max().item()
-                            if min_step_id < 0 or max_step_id >= model_vocab_size: continue 
+                            if min_step_id < 0 or max_step_id >= model_vocab_size:
+                                printc(f"ERROR: Invalid step token IDs (min={min_step_id}, max={max_step_id}) step {step_idx}, train_step {train_step_display}!", "red"); continue # Skip step
 
+                            # --- Extract Step Log Probs & Check Grad ---
                             step_policy_log_probs_dist = self.extract_step_values(full_policy_log_probs, prompt_completion_ids, step_input_ids)
-                            if step_policy_log_probs_dist is None: continue 
-                            if not step_policy_log_probs_dist.requires_grad: printc(f"ERROR: step NO grad after extract! item {train_step}, step {step_idx}", "red"); gradient_lost_in_loop = True; break
+                            if step_policy_log_probs_dist is None:
+                                printc(f"Skipping step {step_idx} (failed to extract policy log probs) at train_step {train_step_display}", "yellow"); continue
+                            if not step_policy_log_probs_dist.requires_grad:
+                                printc(f"ERROR: step policy log_probs NO grad after extract! item {train_step_display}, step {step_idx}", "red")
+                                gradient_lost_in_loop = True; break # Stop processing steps for this item
 
-                            step_kl_div = self.extract_step_values(full_per_token_kl, prompt_completion_ids, step_input_ids) ; # ... kl alignment ...
-                            if step_kl_div is None: step_kl_div = torch.zeros_like(step_policy_log_probs_dist[:,:,0]) # Use policy shape
-                            elif step_kl_div.shape[1] != step_policy_log_probs_dist.shape[1]: 
-                                kl_len, pol_len = step_kl_div.shape[1], step_policy_log_probs_dist.shape[1]
-                                if kl_len > pol_len: step_kl_div = step_kl_div[:, :pol_len]
-                                elif kl_len < pol_len: step_kl_div = F.pad(step_kl_div, (0, pol_len - kl_len), value=0.0)
-                                if step_kl_div.shape[1] != step_policy_log_probs_dist.shape[1]: step_kl_div = torch.zeros_like(step_policy_log_probs_dist[:,:,0])
+                            # --- Extract Step KL & Align ---
+                            step_kl_div = self.extract_step_values(full_per_token_kl, prompt_completion_ids, step_input_ids)
+                            actual_slice_len = step_policy_log_probs_dist.shape[1] # Use length from policy slice
 
-                            actual_slice_len = step_policy_log_probs_dist.shape[1]
-                            if actual_slice_len != step_input_ids.shape[1]: step_input_ids = step_input_ids[:, :actual_slice_len]; # ... check empty ...
-                            if step_input_ids.shape[1] == 0: continue
+                            if step_kl_div is None:
+                                # If KL couldn't be extracted (e.g., ref model failed or KL calc failed), use zeros
+                                # Ensure shape matches the policy log probs slice shape (B, slice_len)
+                                step_kl_div = torch.zeros(step_policy_log_probs_dist.shape[0], actual_slice_len, device=device, dtype=torch.float32)
+                                # printc(f"Using zero KL for step {step_idx} (extract failed) at train_step {train_step_display}", "grey")
+                            elif step_kl_div.shape[1] != actual_slice_len:
+                                # If KL slice length doesn't match policy slice length (e.g., due to padding/eos differences)
+                                printc(f"Warning: KL div slice length ({step_kl_div.shape[1]}) != policy slice length ({actual_slice_len}) for step {step_idx}, train_step {train_step_display}. Padding/truncating KL.", "yellow")
+                                # Pad or truncate KL slice to match policy slice length
+                                diff = actual_slice_len - step_kl_div.shape[1]
+                                if diff > 0: # Pad KL
+                                    step_kl_div = F.pad(step_kl_div, (0, diff), value=0.0) # Pad last dimension (length)
+                                elif diff < 0: # Truncate KL
+                                    step_kl_div = step_kl_div[:, :actual_slice_len]
+                                # Double check shape after adjustment
+                                if step_kl_div.shape[1] != actual_slice_len:
+                                      printc(f"ERROR: KL div alignment failed for step {step_idx}, train_step {train_step_display}. Using zero KL.", "red")
+                                      step_kl_div = torch.zeros(step_policy_log_probs_dist.shape[0], actual_slice_len, device=device, dtype=torch.float32)
 
-                            step_indices_for_gather = step_input_ids.unsqueeze(-1); # ... index validation ...
+
+                            # --- Align step_input_ids length if needed ---
+                            if actual_slice_len != step_input_ids.shape[1]:
+                                # This happens if extract_step_values returned a shorter slice than step tokens
+                                # Use the shorter length from the extracted log_probs/KL
+                                # printc(f"Aligning step_input_ids length ({step_input_ids.shape[1]}) to actual slice length ({actual_slice_len}) for step {step_idx}", "grey")
+                                step_input_ids = step_input_ids[:, :actual_slice_len]
+
+                            if step_input_ids.shape[1] == 0:
+                                printc(f"Skipping step {step_idx} (empty after alignment) at train_step {train_step_display}", "grey")
+                                continue # Skip if alignment results in empty IDs
+
+                            # --- Gather Log Probs for Actual Step Tokens & Check Grad ---
+                            step_indices_for_gather = step_input_ids.unsqueeze(-1)
+                            # Validate indices before gather
                             min_gather_idx, max_gather_idx = step_indices_for_gather.min().item(), step_indices_for_gather.max().item()
-                            if min_gather_idx < 0 or max_gather_idx >= step_policy_log_probs_dist.shape[-1]: continue
+                            log_probs_vocab_size = step_policy_log_probs_dist.shape[-1]
+                            if min_gather_idx < 0 or max_gather_idx >= log_probs_vocab_size:
+                                printc(f"ERROR: Invalid indices for gather (min={min_gather_idx}, max={max_gather_idx}, vocab={log_probs_vocab_size}) step {step_idx}, train_step {train_step_display}!", "red"); continue
 
-                            policy_log_probs = torch.gather(step_policy_log_probs_dist, -1, step_indices_for_gather).squeeze(-1)
-                            if not policy_log_probs.requires_grad: printc(f"ERROR: step NO grad after gather! item {train_step}, step {step_idx}", "red"); gradient_lost_in_loop = True; break
+                            policy_log_probs_for_step_tokens = torch.gather(step_policy_log_probs_dist, -1, step_indices_for_gather).squeeze(-1)
+                            if not policy_log_probs_for_step_tokens.requires_grad:
+                                printc(f"ERROR: step policy log_probs NO grad after gather! item {train_step_display}, step {step_idx}", "red")
+                                gradient_lost_in_loop = True; break # Stop processing steps
 
-                            step_value_loss = torch.tensor(0.0, device=device, dtype=torch.float32) # Value loss still disabled
-                            policy_loss_term_unreduced = -policy_log_probs * step_reward_tensor.unsqueeze(-1)
-                            kl_loss_term_unreduced = step_kl_div * self.rft_config.beta
-                            if not policy_loss_term_unreduced.requires_grad: printc(f"ERROR: step loss NO grad! item {train_step}, step {step_idx}", "red"); gradient_lost_in_loop = True; break
+                            # --- Calculate Step Losses ---
+                            # Policy Loss (Reinforce-style: -log_prob * reward)
+                            policy_loss_term_unreduced = -policy_log_probs_for_step_tokens * step_reward_tensor.unsqueeze(-1)
 
-                            if torch.isnan(policy_loss_term_unreduced).any() or torch.isinf(policy_loss_term_unreduced).any(): continue
-                            if torch.isnan(kl_loss_term_unreduced).any() or torch.isinf(kl_loss_term_unreduced).any(): kl_loss_term_unreduced = torch.zeros_like(kl_loss_term_unreduced)
+                            # KL Loss (KL * beta)
+                            kl_loss_term_unreduced = step_kl_div * self.rft_config.beta # step_kl_div should be (B, slice_len)
 
+                            # Value Loss (Currently disabled/zero)
+                            # TODO: Implement value head prediction and loss if needed
+                            step_value_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+
+                            # Check final loss terms for grad before appending
+                            if not policy_loss_term_unreduced.requires_grad:
+                                printc(f"ERROR: step policy loss term NO grad! item {train_step_display}, step {step_idx}", "red")
+                                gradient_lost_in_loop = True; break
+
+                            # Check for NaN/Inf in loss terms before appending
+                            if torch.isnan(policy_loss_term_unreduced).any() or torch.isinf(policy_loss_term_unreduced).any():
+                                printc(f"Warning: NaN/Inf detected in policy loss term for step {step_idx} at train_step {train_step_display}. Skipping step.", "yellow")
+                                continue # Skip this step's contribution
+                            if torch.isnan(kl_loss_term_unreduced).any() or torch.isinf(kl_loss_term_unreduced).any():
+                                printc(f"Warning: NaN/Inf detected in KL loss term for step {step_idx} at train_step {train_step_display}. Using zero KL for this step.", "yellow")
+                                kl_loss_term_unreduced = torch.zeros_like(kl_loss_term_unreduced) # Zero out KL if problematic
+
+                            # Append valid loss terms (shape: B, step_slice_len)
                             all_policy_loss_terms.append(policy_loss_term_unreduced)
                             all_kl_loss_terms.append(kl_loss_term_unreduced)
-                            all_value_losses.append(step_value_loss * self.rft_config.vf_coef)
-                            total_steps_len_tokens += actual_slice_len
+                            all_value_losses.append(step_value_loss * self.rft_config.vf_coef) # Append value loss (even if zero)
+                            total_steps_len_tokens += actual_slice_len # Use actual slice len processed
+
                         except Exception as step_e:
-                             printc(f"Error during step processing item {train_step}, step {step_idx}: {step_e}", "red")
-                             continue
+                             printc(f"Error during step processing loop for item {train_step_display}, step {step_idx}: {step_e}", "red")
+                             # Decide if we should break the inner loop or just skip the step
+                             continue # Skip this step, try the next one
 
-                    # --- Combine Accumulated Losses ---
+
+                    # --- Combine Accumulated Losses (if steps processed and no grad lost) ---
                     if total_steps_len_tokens > 0 and all_policy_loss_terms and not gradient_lost_in_loop:
-                        total_policy_loss_terms = torch.cat(all_policy_loss_terms, dim=1)
-                        if not total_policy_loss_terms.requires_grad: printc(f"ERROR: NO grad after cat! item {train_step}", "red"); continue # Skip item if grad lost
+                        try:
+                            # Concatenate losses across steps (dim=1 is the sequence dimension)
+                            total_policy_loss_terms = torch.cat(all_policy_loss_terms, dim=1) # Shape (B, total_steps_len_tokens)
+                            total_kl_loss_terms = torch.cat(all_kl_loss_terms, dim=1)       # Shape (B, total_steps_len_tokens)
 
-                        total_kl_loss_terms = torch.cat(all_kl_loss_terms, dim=1)
-                        avg_policy_loss = total_policy_loss_terms.mean()
-                        if not avg_policy_loss.requires_grad: printc(f"ERROR: NO grad after mean! item {train_step}", "red"); continue # Skip item
+                            # Check gradients after concatenation (should be preserved)
+                            if not total_policy_loss_terms.requires_grad:
+                                printc(f"ERROR: Policy loss NO grad after cat! item {train_step_display}", "red")
+                                continue # Skip backward for this item
 
-                        avg_kl_loss = total_kl_loss_terms.mean()
-                        avg_value_loss = torch.stack(all_value_losses).mean() if all_value_losses else torch.tensor(0.0, device=device)
+                            # Calculate average loss across all tokens in all steps
+                            avg_policy_loss = total_policy_loss_terms.mean()
+                            avg_kl_loss = total_kl_loss_terms.mean()
+                            # Average value loss across steps (currently zero)
+                            avg_value_loss = torch.stack(all_value_losses).mean() if all_value_losses else torch.tensor(0.0, device=device)
 
-                        if not (torch.isnan(avg_policy_loss) or torch.isinf(avg_policy_loss) or torch.isnan(avg_kl_loss) or torch.isinf(avg_kl_loss) or torch.isnan(avg_value_loss) or torch.isinf(avg_value_loss)):
-                            total_loss = avg_policy_loss + avg_kl_loss + avg_value_loss
-                            if total_loss.requires_grad:
-                                perform_backward = True
-                                log_policy_loss = avg_policy_loss.item()
-                                log_kl_loss = avg_kl_loss.item()
-                                log_value_loss = avg_value_loss.item()
-                                log_total_loss = total_loss.item()
-                            else: printc(f"ERROR: Final total_loss NO grad! item {train_step}", "red")
-                        else: printc(f"ERROR: NaN/Inf in final avg losses item {train_step}. Skipping backward.", "red")
+                            # Check gradients after mean (should be preserved)
+                            if not avg_policy_loss.requires_grad:
+                                printc(f"ERROR: Policy loss NO grad after mean! item {train_step_display}", "red")
+                                continue # Skip backward
+
+                            # --- Final Loss Calculation & Validation ---
+                            if not (torch.isnan(avg_policy_loss) or torch.isinf(avg_policy_loss) or
+                                    torch.isnan(avg_kl_loss) or torch.isinf(avg_kl_loss) or
+                                    torch.isnan(avg_value_loss) or torch.isinf(avg_value_loss)):
+
+                                total_loss = avg_policy_loss + avg_kl_loss + avg_value_loss
+
+                                # Final gradient check on the combined loss
+                                if total_loss.requires_grad:
+                                    perform_backward = True # Set flag to perform backward pass
+                                    # Store item losses for logging (average over the item)
+                                    log_policy_loss = avg_policy_loss.item()
+                                    log_kl_loss = avg_kl_loss.item()
+                                    log_value_loss = avg_value_loss.item()
+                                    log_total_loss = total_loss.item()
+                                else:
+                                    # This should ideally not happen if previous checks passed
+                                    printc(f"ERROR: Final total_loss NO grad! item {train_step_display}", "red")
+                            else:
+                                printc(f"ERROR: NaN/Inf in final average losses item {train_step_display}. Skipping backward.", "red")
+                                total_loss = None # Ensure total_loss is None if invalid
+
+                        except Exception as loss_combine_e:
+                            printc(f"Error combining step losses for item {train_step_display}: {loss_combine_e}", "red")
+                            total_loss = None # Ensure no backward pass if combination fails
+                            perform_backward = False
+
+                    elif gradient_lost_in_loop:
+                         printc(f"Skipping backward for item {train_step_display} due to gradient lost during step processing.", "yellow")
+                         total_loss = None
+                         perform_backward = False
+                    # else: # Case: no steps processed or other condition preventing loss calculation
+                    #    if total_steps_len_tokens <= 0: printc(f"Skipping backward for item {train_step_display} (no valid steps processed).", "grey")
+                    #    elif not all_policy_loss_terms: printc(f"Skipping backward for item {train_step_display} (no policy loss terms generated).", "grey")
+                    #    total_loss = None
+                    #    perform_backward = False
 
 
                 # --- Catch errors from the entire item processing block ---
                 except Exception as item_processing_error:
-                     printc(f"Error during main processing block for item {train_step}: {item_processing_error}", "red")
+                     printc(f"Error during main processing block for item {train_step_display}: {item_processing_error}", "red")
                      # Ensure we skip backward/optimizer step for this item
                      perform_backward = False
                      total_loss = None # Prevent potential use later
 
 
-                # --- Perform Backward Pass ---
+                # --- Perform Backward Pass (if loss is valid and requires grad) ---
                 if perform_backward and total_loss is not None:
+                    # Apply loss scaling for accumulation
                     loss_to_backward = total_loss / self.rft_config.gradient_accumulation_steps
                     try:
+                        # Use accelerator for backward pass
                         self.accelerator.backward(loss_to_backward)
-                    except Exception as backward_e: # Catch broad errors
-                         printc(f"Error during backward pass for item {train_step}: {backward_e}", "red")
-                         # Maybe prevent optimizer step if backward fails? Depends on strategy.
-                         # perform_backward = False # Maybe not needed if optimizer step handles errors
-                else:
-                     # Print if backward was skipped intentionally
-                     # if total_loss is None and not gradient_lost_in_loop: printc(f"Skipping backward for item {train_step} (no valid loss)", "grey")
-                     # If gradient_lost_in_loop, message was already printed
-                     pass
+                        # print(f"Backward pass succeeded for step {train_step_display}") # Debug print
+                    except Exception as backward_e:
+                         printc(f"Error during backward pass for item {train_step_display}: {backward_e}", "red")
+                         # Decide if this error should prevent optimizer step. Usually yes.
+                         # Maybe zero gradients here if backward failed partially?
+                         # optimizer.zero_grad() # Optional: zero grads if backward fails to prevent bad update
+                         perform_backward = False # Prevent optimizer step if backward failed
+                # else: # Log if backward was skipped
+                     # if total_loss is None and not gradient_lost_in_loop and not item_processing_error: # Avoid double logging
+                     #    printc(f"Skipping backward for item {train_step_display} (no valid loss computed or grad lost).", "grey")
 
 
-                # --- Gradient Update Step ---
-                is_accumulation_step_complete = (train_step + 1) % self.rft_config.gradient_accumulation_steps == 0
-                if is_accumulation_step_complete:
-                    if self.rft_config.max_grad_norm is not None:
-                        if self.accelerator.mixed_precision == "fp16" or self.accelerator.mixed_precision == "bf16":
-                           self.accelerator.unscale_gradients(optimizer)
-                        self.accelerator.clip_grad_norm_(model.parameters(), self.rft_config.max_grad_norm)
+                # --- Gradient Update Step (Optimizer Step) ---
+                # Check if we have processed enough steps for one update
+                is_accumulation_step_complete = (current_epoch_step % self.rft_config.gradient_accumulation_steps) == 0
+                
+                # Check if we are on the last batch of the epoch (if length is known)
+                is_last_batch_in_epoch = (len_dataloader is not None and current_epoch_step == len_dataloader)
+
+                # Perform optimizer step if accumulation is complete OR it's the last batch (to avoid dropping gradients)
+                # Also check if *any* backward pass was successfully performed in this accumulation cycle
+                # (This requires tracking if perform_backward was true at least once since last optimizer step - more complex state needed)
+                # Simpler check: perform update if accumulation complete or last batch, assuming backward *might* have happened.
+                # The gradient clipping and optimizer step should handle zero gradients correctly if no backward passes occurred.
+                if is_accumulation_step_complete or is_last_batch_in_epoch:
+                    # print(f"Attempting optimizer step at epoch_step {current_epoch_step}, global_step {self.state.global_step}") # Debug print
+                    
+                    # Gradient Clipping (Optional but recommended)
+                    if self.rft_config.max_grad_norm is not None and self.rft_config.max_grad_norm > 0:
+                        try:
+                            # Accelerator handles unscaling automatically if needed before clipping
+                            self.accelerator.clip_grad_norm_(model.parameters(), self.rft_config.max_grad_norm)
+                        except Exception as clip_e:
+                             printc(f"Error during gradient clipping at global step {self.state.global_step}: {clip_e}", "red")
+                             # Continue without clipping? Or stop? Depends on severity.
+
+                    # Optimizer Step
                     try:
                         optimizer.step()
+                        # print(f"Optimizer step succeeded at global step {self.state.global_step}") # Debug print
                     except Exception as optim_e:
-                         printc(f"Error during optimizer.step() at train_step {train_step}: {optim_e}", "red")
-                    if lr_scheduler is not None:
-                        with self.accelerator.main_process_first():
-                             lr_scheduler.step()
-                    optimizer.zero_grad()
-                    self.state.global_step += 1
+                         printc(f"Error during optimizer.step() at global step {self.state.global_step}: {optim_e}", "red")
+                         # Consider stopping training or just logging the error
 
-                    # Logging
-                    if self.accelerator.is_main_process and (self.state.global_step % self.rft_config.logging_steps == 0):
-                         logs = {"train/loss": log_total_loss, "train/policy_loss": log_policy_loss, "train/kl_loss": log_kl_loss, "train/value_loss": log_value_loss, "step": self.state.global_step, "epoch": round(epoch + ((train_step + 1) / len_dataloader), 2)}
-                         if lr_scheduler is not None: lr_list = lr_scheduler.get_last_lr(); logs["train/learning_rate"] = lr_list[0] if lr_list else 0.0
+                    # Learning Rate Scheduler Step (if applicable)
+                    if lr_scheduler is not None:
+                        try:
+                            # Use accelerator.main_process_first to ensure scheduler step happens correctly in distributed settings
+                            with self.accelerator.main_process_first():
+                                 lr_scheduler.step()
+                        except Exception as sched_e:
+                             printc(f"Error during lr_scheduler.step() at global step {self.state.global_step}: {sched_e}", "red")
+
+                    # Zero Gradients
+                    optimizer.zero_grad(set_to_none=True) # Use set_to_none=True for potential memory savings
+
+                    # Increment global step counter AFTER optimizer step
+                    self.state.global_step += 1
+                    global_step_for_loop += 1 # Update loop counter as well
+
+                    # --- Logging ---
+                    # Log based on global_step and logging_steps configuration
+                    if self.args.logging_steps > 0 and (self.state.global_step % self.args.logging_steps == 0):
+                         # Gather logs. Use the losses from the *last* item processed in the accumulation cycle
+                         # More sophisticated logging would average losses over the accumulation cycle.
+                         logs = {
+                             "train/loss": log_total_loss, # Loss of the last contributing item
+                             "train/policy_loss": log_policy_loss,
+                             "train/kl_loss": log_kl_loss,
+                             "train/value_loss": log_value_loss, # Currently zero
+                             "step": self.state.global_step, # Current global step
+                             # Calculate epoch float value carefully
+                             "epoch": round(epoch + (current_epoch_step / len_dataloader if len_dataloader else 0.0), 2)
+                         }
+                         if lr_scheduler is not None:
+                             try:
+                                 lr_list = lr_scheduler.get_last_lr()
+                                 logs["train/learning_rate"] = lr_list[0] if lr_list else 0.0
+                             except Exception:
+                                  logs["train/learning_rate"] = "Error"
+                         else:
+                              # Log optimizer's LR if no scheduler
+                              try:
+                                   logs["train/learning_rate"] = optimizer.param_groups[0]['lr']
+                              except Exception:
+                                   logs["train/learning_rate"] = "N/A"
+
+                         # Use self.log() which handles accelerator processes and integrations (like WandB)
                          self.log(logs)
 
+
+                # --- Trigger Step End Callback ---
                 self.control = self.callback_handler.on_step_end(self.args, self.state, self.control)
 
-                # --- Cleanup per item ---
-                # (Same cleanup code using del as before)
-                # ...
+                # --- Check for Training Stop Signal ---
+                if self.control.should_training_stop:
+                    printc("Training stopping signal received from callbacks or max_steps.", "yellow")
+                    break # Exit inner batch loop
 
-            # --- End of Epoch ---
-            printc(f"Epoch {epoch+1} finished.", "blue")
+
+            # --- End of Epoch Handling ---
+            printc(f"Epoch {epoch+1} finished. Global step: {self.state.global_step}", "blue")
             self.control = self.callback_handler.on_epoch_end(self.args, self.state, self.control)
+
+            # Check stop signal again after epoch end callbacks
             if self.control.should_training_stop:
-                print("Training stopping signal received.")
-                break # Exit epoch loop
+                break # Exit outer epoch loop
 
 
         # --- End of Training ---
-        printc("Training finished.", "blue")
-        # Callbacks at the end - Error might still happen here if progress bar issue persists
+        printc(f"Training finished after {self.state.global_step} global steps.", "blue")
+        # Trigger Train End Callbacks
         try:
             self.control = self.callback_handler.on_train_end(self.args, self.state, self.control)
         except AttributeError as e:
+             # Catch specific error related to progress bar closure if it happens
              if "'NoneType' object has no attribute 'close'" in str(e):
                   printc("Info: Progress bar closure failed (likely due to non-interactive environment or callback issue). Training itself completed.", "yellow")
              else:
-                  raise e # Re-raise other attribute errors
+                  # Re-raise other unexpected attribute errors
+                  printc(f"AttributeError during on_train_end: {e}", "red")
+                  raise e
         except Exception as train_end_e:
+             # Catch any other errors during final callbacks
              printc(f"Error during on_train_end callbacks: {train_end_e}", "yellow")
 
 
