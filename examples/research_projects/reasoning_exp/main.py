@@ -17,18 +17,18 @@ import os # Import os for environment variables if needed
 
 # --- Configuration ---
 # Set environment variable for CUDA behavior (optional, for debugging)
-# os.environ["CUDA_LAUNCH_BLOCKING"] = "1" 
+# os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
 # Choose precision: bfloat16 is recommended for stability on Ampere+ GPUs
 # Use float32 if bf16 is not supported or issues persist
 # Avoid float16 due to previous numerical instability issues
-compute_dtype = torch.bfloat16 
-# compute_dtype = torch.float32 
+compute_dtype = torch.bfloat16
+# compute_dtype = torch.float32
 
 # Choose attention implementation: 'eager' is safer given the previous SWA/SDPA warning
 # 'sdpa' might work with bf16/fp32 but 'eager' avoids the potential conflict
-attn_implementation = "eager" 
-# attn_implementation = "sdpa" 
+attn_implementation = "eager"
+# attn_implementation = "sdpa"
 
 # Model name
 model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
@@ -38,7 +38,7 @@ model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 # Force CUDA as per original script, ensure it's available
 if not torch.cuda.is_available():
     raise SystemError("CUDA device not found, but script requires it.")
-device = torch.device("cuda") 
+device = torch.device("cuda")
 print(f"Using device: {device}")
 print(f"Using compute dtype: {compute_dtype}")
 print(f"Using attention implementation: {attn_implementation}")
@@ -50,13 +50,13 @@ if tokenizer.pad_token is None:
     print("Tokenizer missing pad token, setting to eos_token.")
     tokenizer.pad_token = tokenizer.eos_token
     # Make sure pad_token_id is set in the tokenizer object
-    tokenizer.pad_token_id = tokenizer.eos_token_id 
+    tokenizer.pad_token_id = tokenizer.eos_token_id
 
 # --- Load Base Model ---
 print(f"Loading base model: {model_name}")
 model = AutoModelForCausalLM.from_pretrained(
-    model_name, 
-    torch_dtype=compute_dtype, 
+    model_name,
+    torch_dtype=compute_dtype,
     attn_implementation=attn_implementation,
     # trust_remote_code=True # Add if required by the model
 ).to(device)
@@ -87,7 +87,7 @@ lora_config = LoraConfig(
 # --- Apply LoRA/PEFT to the model ---
 print("Applying LoRA PEFT adapter...")
 # If using quantization (not currently), uncomment prepare_model_for_kbit_training
-# model = prepare_model_for_kbit_training(model) 
+# model = prepare_model_for_kbit_training(model)
 model = get_peft_model(model, lora_config)
 model.print_trainable_parameters()  # Display the number of trainable parameters
 
@@ -95,7 +95,7 @@ model.print_trainable_parameters()  # Display the number of trainable parameters
 # Load the reference model WITHOUT PEFT adapter, using the same precision and attn implementation
 print(f"Loading reference model: {model_name}")
 ref_model = AutoModelForCausalLM.from_pretrained(
-    model_name, 
+    model_name,
     torch_dtype=compute_dtype,
     attn_implementation=attn_implementation,
     # trust_remote_code=True # Add if required
@@ -125,7 +125,7 @@ config = RFTConfig(
     logging_steps=10, # Log every 10 global steps
     # bf16=True if compute_dtype == torch.bfloat16 else False, # Let Trainer handle precision based on Accelerator
     # fp16=True if compute_dtype == torch.float16 else False, # Avoid fp16
-    report_to="tensorboard", # Or "wandb", "none"
+    report_to="none", # Explicitly disable external reporting integrations like TensorBoard/WandB
     remove_unused_columns=False, # Important for custom datasets in TRL
     # Add any other TrainingArguments needed
 )
@@ -144,7 +144,7 @@ config.system_prompt = 'Solve the mystery:\n'
 # Load dataset (after tokenizer is ready, if preprocessing depends on it)
 dataset = load_dataset("danikhan632/OpenMystery", split="train")
 # Optional: Shuffle or select subset
-# dataset = dataset.shuffle(seed=42).select(range(1000)) 
+# dataset = dataset.shuffle(seed=42).select(range(1000))
 
 # --- Initialize Trainer ---
 # Let the Trainer handle optimizer and scheduler creation based on config and PEFT setup
@@ -165,4 +165,4 @@ trainer.train()
 
 print("Training finished.")
 # Optionally save the final adapter
-# trainer.save_model("./rft_mystery_output/final_adapter") 
+# trainer.save_model("./rft_mystery_output/final_adapter")
