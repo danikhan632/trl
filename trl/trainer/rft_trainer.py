@@ -511,8 +511,8 @@ class RFTTrainer(Trainer):
     def _compute_logprobs_and_states(self, model_instance, input_ids, attention_mask, get_hidden_states: bool):
         # Helper remains the same
         if model_instance is None: raise ValueError("_compute_logprobs_and_states called with None.")
-        is_ref_computation = (model_instance == self.ref_model) or \
-                             (self.is_peft_model and self.ref_model is None and model_instance == self.model) # Comparing prepared instances
+        is_ref_computation = (model_instance == self.ref_model)
+
         enable_grads = not is_ref_computation
         peft_adapter_manager = nullcontext()
         model_to_use = model_instance
