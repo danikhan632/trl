@@ -353,10 +353,6 @@ class RFTTrainer(Trainer):
         # --- Argument Validation and Merging ---
         if not isinstance(rft_config, RFTConfig):
             raise TypeError("`rft_config` must be an instance of RFTConfig.")
-        if args is None:
-             print("Warning: `args` (TrainingArguments) not provided separately, assuming `rft_config` contains all necessary fields.")
-             args = rft_config
-
         self.rft_config = rft_config # Store RFT specific settings
 
         # --- Load Model ---
