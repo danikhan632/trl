@@ -424,7 +424,7 @@ class RFTTrainer(Trainer):
         # Pass the correct argument name (`tokenizer`) to the parent class
         super().__init__(
             model=model,
-            args=args,
+            args=rft_config,
             data_collator=data_collator,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
