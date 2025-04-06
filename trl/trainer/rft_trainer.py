@@ -576,8 +576,8 @@ class RFTTrainer(Trainer):
                 batch_item = batch[0] # Still assumes single item processing per backward pass
 
                 # --- 1 & 2. Prompt Setup ---
-                question = batch_item[self.rft_config.start_state]
-                solution = batch_item[self.rft_config.solution]
+                question = batch_item[self.rft_config.question]
+                solution = batch_item[self.rft_config.answer]
                 messages = [{'role': 'user', 'content': self.rft_config.system_prompt + question}]
                 q_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
                 q_text += self.rft_config.b_think
