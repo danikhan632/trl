@@ -543,27 +543,6 @@ class RFTTrainer(Trainer):
         if step_values.shape[1] != step_len: pass # Allow shorter slice due to generation end
         return step_values
 
-import torch
-import torch.nn.functional as F
-from contextlib import contextmanager, nullcontext
-# Assuming other necessary imports are present (Trainer, Accelerator, etc.)
-# Ensure printc is defined or replaced with print
-
-class RFTTrainer(Trainer):
-    # ... (Include the REVISED _compute_logprobs_and_states from previous answers) ...
-    # ... (Other methods like __init__, _optional_no_grad, get_ref_log_probs, etc.) ...
-
-    @contextmanager
-    def _optional_no_grad(self, condition: bool):
-        """Context manager to conditionally apply torch.no_grad()"""
-        if condition:
-            with torch.no_grad():
-                yield
-        else:
-            yield
-
-    # --- Assume _compute_logprobs_and_states is defined correctly here ---
-    # (Crucially handles gradient enabling/disabling for policy/ref model)
 
     def train(self, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None, **kwargs):
         """Main training loop for RFT. With robust error handling and grad checks."""
