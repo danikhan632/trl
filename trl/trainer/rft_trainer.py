@@ -621,9 +621,9 @@ class RFTTrainer(Trainer):
 
     def extract_step_values(self, full_sequence_tensor, full_input_ids, step_input_ids):
         # Helper remains the same, added more verbose checks
-        if full_sequence_tensor is None or step_input_ids is None or step_input_ids.shape[1 == 0]:
-            # printc("Extract step values: Invalid input (None or empty step).", "grey")
+        if full_sequence_tensor is None or step_input_ids is None or step_input_ids.shape[1] == 0:
             return None
+
 
         batch_size, seq_len = full_input_ids.shape
         step_len = step_input_ids.shape[1]
