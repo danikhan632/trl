@@ -64,6 +64,8 @@ _import_structure = {
     "prm_trainer": ["PRMTrainer"],
     "reward_config": ["RewardConfig"],
     "reward_trainer": ["RewardTrainer"],
+    "rft_config": ["RFTConfig"],
+    "rft_trainer": ["RFTTrainer"],
     "rloo_config": ["RLOOConfig"],
     "rloo_trainer": ["RLOOTrainer"],
     "sft_config": ["SFTConfig"],
@@ -135,6 +137,8 @@ if TYPE_CHECKING:
     from .prm_trainer import PRMTrainer
     from .reward_config import RewardConfig
     from .reward_trainer import RewardTrainer
+    from .rft_config import RFTConfig
+    from .rft_trainer import RFTTrainer
     from .rloo_config import RLOOConfig
     from .rloo_trainer import RLOOTrainer
     from .sft_config import SFTConfig
