@@ -133,7 +133,8 @@ def evaluate_state(critic_prompt, cumulative_reasons, model="gpt-4o"):
         # Enrich the steps with their scores and highlight data
         enriched_steps = []
         # Iterate only over the minimum length of the two lists
-        num_steps = min(len(cumulative_reasons), len(data["chain_of_thought"]))
+        num_steps =  len(data["chain_of_thought"])
+
         for i in range(num_steps):
             enriched_steps.append({
                 "id": f"thought_{i}",
@@ -1008,7 +1009,18 @@ class RFTTrainer(Trainer):
                     except Exception as decode_e:
                          printc(f"Error decoding completion at step {train_step_display}: {decode_e}", "red"); continue
 
-                    split_result = full_text.split(self.rft_config.e_think, 1)
+
+
+                    delimiter = self.rft_config.e_think
+                    full_text = full_text[len(self.rft_config.b_think):]
+                    
+                    index = full_text.find(delimiter)
+
+                    if index != -1:
+                        split_result = [full_text[:index], full_text[index:]]
+                    else:
+                        split_result = [full_text]
+
                     if len(split_result) >= 2: cot, answer = split_result[0].strip(), split_result[1].strip()
                     else: cot, answer = split_result[0].strip(), self.rft_config.answer_default # Use default if no split
 
@@ -1087,7 +1099,7 @@ class RFTTrainer(Trainer):
                             # --- Determine reward ---
                             reward_key = 'whitened_score' if self.rft_config.whiten_rewards and 'whitened_score' in step_info else 'combined_score'
                             if reward_key not in step_info:
-                                printc(f"Skipping step {step_idx} (missing reward key '{reward_key}') at train_step {train_step_display}", "grey")
+                                printc(f"Skipping step {step_idx} (missing reward key '{reward_key}') at train_step {train_step_display}", "green")
                                 continue
                             step_reward = step_info[reward_key]
                             # Validate reward value
@@ -1096,10 +1108,9 @@ class RFTTrainer(Trainer):
                                 step_reward = 0.0
                             step_reward_tensor = torch.tensor(step_reward, device=device, dtype=torch.float32)
 
-                            # --- Tokenize Step & Validate ---
                             step_text = step_info.get("txt")
                             if not step_text:
-                                 printc(f"Skipping step {step_idx} (empty text) at train_step {train_step_display}", "grey")
+                                 printc(f"Skipping step {step_idx} (empty text) at train_step {train_step_display}", "yellow")
                                  continue
                             step_tokenized = tokenizer(step_text, return_tensors="pt", padding=False, add_special_tokens=False)
                             step_input_ids = step_tokenized['input_ids'].to(device)

@@ -19,12 +19,12 @@ import os
 # os.environ["CUDA_LAUNCH_BLOCKING"] = "1" 
 compute_dtype = torch.bfloat16 
 attn_implementation = "eager" 
-model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+model_name = "Qwen/Qwen3-0.6B"
 
-# Device setup
-if not torch.cuda.is_available():
-    raise SystemError("CUDA device not found, but script requires it.")
-device = torch.device("cuda") 
+# # Device setup
+# if not torch.cuda.is_available():
+#     raise SystemError("CUDA device not found, but script requires it.")
+device = torch.device("cpu") 
 print(f"Using device: {device}")
 print(f"Using compute dtype: {compute_dtype}")
 print(f"Using attention implementation: {attn_implementation}")
