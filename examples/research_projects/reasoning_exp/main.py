@@ -56,21 +56,7 @@ if model.config.vocab_size != len(tokenizer):
 else:
     print("  Vocab sizes already match.")
 
-# --- LoRA Configuration ---
-lora_config = LoraConfig(
-    r=8,                      
-    lora_alpha=32,            
-    target_modules=["q_proj", "v_proj"], 
-    lora_dropout=0.05,
-    bias="none",
-    task_type="CAUSAL_LM",
-)
 
-# --- Apply LoRA/PEFT to the model ---
-print("Applying LoRA PEFT adapter...")
-# model = prepare_model_for_kbit_training(model) # If using quantization
-model = get_peft_model(model, lora_config)
-model.print_trainable_parameters() 
 
 # --- Load Reference Model ---
 print(f"Loading reference model: {model_name}")
@@ -150,7 +136,6 @@ trainer = RFTTrainer(
     rft_config=config,          
     train_dataset=dataset,
     processing_class=tokenizer, 
-    peft_config=lora_config,    # Still pass peft_config for awareness if needed by Trainer logic
     optimizers=(optimizer, lr_scheduler), # Pass the created optimizer and scheduler
 )
 
@@ -159,4 +144,4 @@ print("Starting training...")
 trainer.train()
 
 print("Training finished.")
-# trainer.save_model("./rft_mystery_output/final_adapter") 
+trainer.save_model("./rft_mystery_output/final_adapter") 
