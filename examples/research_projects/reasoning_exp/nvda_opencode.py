@@ -17,14 +17,14 @@ import os
 
 # --- Configuration ---
 # os.environ["CUDA_LAUNCH_BLOCKING"] = "1" 
-compute_dtype = torch.bfloat16 
+compute_dtype = torch.float16 
 attn_implementation = "eager" 
 model_name = "Qwen/Qwen3-0.6B"
 
 # # Device setup
 # if not torch.cuda.is_available():
 #     raise SystemError("CUDA device not found, but script requires it.")
-device = torch.device("cuda:0") 
+device = torch.device("cpu") 
 print(f"Using device: {device}")
 print(f"Using compute dtype: {compute_dtype}")
 print(f"Using attention implementation: {attn_implementation}")
@@ -83,7 +83,7 @@ config = RFTConfig(
     output_dir="./rft_mystery_output", 
     num_train_epochs=1, 
     per_device_train_batch_size=1, 
-    gradient_accumulation_steps=8, 
+    gradient_accumulation_steps=1, 
     learning_rate=1e-4, # This LR will be used by scheduler, optimizer uses it initially
     logging_steps=10, 
     report_to="none", 
@@ -93,13 +93,14 @@ config = RFTConfig(
 config.b_think = '<|user|>\n<|assistant|><think>' 
 config.e_think = '</think>' 
 config.delimiter = '\n' 
-config.question = 'start_state'
+config.question = 'input'
 config.answer = 'solution'
-config.system_prompt = 'Solve the mystery:\n'
+config.system_prompt = 'Solve the coding question:\n'
+config.debug_log = True
+config.max_completion_length=5000
 
 # --- Load Dataset ---
-dataset = load_dataset("danikhan632/OpenMystery", split="train")
-# dataset = dataset.shuffle(seed=42).select(range(1000)) # Optional subset
+dataset = load_dataset("nvidia/OpenCodeReasoning", 'split_0')['split_0']
 
 # --- Create Optimizer and Scheduler MANUALLY ---
 # Ensure optimizer targets only trainable parameters (PEFT should handle requires_grad correctly)
@@ -144,4 +145,4 @@ print("Starting training...")
 trainer.train()
 
 print("Training finished.")
-trainer.save_model("./rft_mystery_output/final_adapter") 
+trainer.save_model("./rft_code_output/") 

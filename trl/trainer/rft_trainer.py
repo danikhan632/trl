@@ -37,7 +37,7 @@ from transformers import (
     TrainingArguments
 )
 from transformers.utils import is_peft_available
-
+from typing import Optional, Tuple, Dict
 from ..import_utils import is_vllm_available
 from .rft_config import RFTConfig
 from .utils import generate_model_card, get_comet_experiment_url, pad
@@ -79,9 +79,12 @@ def get_per_token_logps(model, input_ids, num_logits_to_keep):
 
 
 
+
+
 # =====================================================
 # RFT Trainer Class (Only __init__ and train are shown for brevity, assuming others are unchanged)
 # =====================================================
+
 class RFTTrainer(Trainer):
     """
     Trainer for Reinforcement Fine-Tuning (RFT) with step-wise rewards.
@@ -89,7 +92,7 @@ class RFTTrainer(Trainer):
     """
     _tag_names = ["trl", "rft"]
 
-    # --- __init__ method remains the same as in the provided code ---
+
     def __init__(
         self,
         model: Union[str, PreTrainedModel],
@@ -251,6 +254,8 @@ class RFTTrainer(Trainer):
 
         elif not hasattr(prepared_model_for_check, 'value_head'):
              printc("Warning: Value head was not found on the *prepared* model. Check initialization and preparation steps.", "red")
+
+
 
 
     @contextmanager
@@ -433,20 +438,17 @@ class RFTTrainer(Trainer):
         # Check if the extracted slice length matches the expected step length
         # It might be shorter if the original generation was shorter than max_length + step_length
         if step_values.shape[1] != step_len:
-            # printc(f"Extract step values: Warning - Extracted slice length ({step_values.shape[1]}) != step token length ({step_len}). May happen if generation ended early.", "grey")
+            printc(f"Extract step values: Warning - Extracted slice length ({step_values.shape[1]}) != step token length ({step_len}). May happen if generation ended early.", "yellow")
             # This is often acceptable, the loss calculation needs to handle potentially shorter sequences.
             pass # Allow shorter slice
 
         if step_values.shape[1] == 0:
-             # printc("Extract step values: Resulting slice is empty.", "grey")
+             printc("Extract step values: Resulting slice is empty.", "yellow")
              return None # Return None if slice ended up empty
 
         return step_values
 
 
-    # ==================================
-    # ===== REWRITTEN TRAIN FUNCTION =====
-    # ==================================
     def train(self, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None, **kwargs):
         """Main training loop for RFT. With robust error handling and grad checks."""
 
@@ -572,7 +574,7 @@ class RFTTrainer(Trainer):
                      default_callbacks.append(ProgressCallback)
                  except ImportError:
                      # Fallback to PrinterCallback if TQDM is not available/broken
-                     printc("TQDM ProgressCallback not available or disabled, using PrinterCallback.", "yellow")
+                     printc("PrinterCallback.", "yellow")
                      default_callbacks.append(PrinterCallback)
              elif self.is_local_process_zero():
                   # If TQDM disabled but we are main process, add PrinterCallback for basic step output
@@ -641,7 +643,7 @@ class RFTTrainer(Trainer):
                 log_total_loss = 0.0; log_policy_loss = 0.0; log_kl_loss = 0.0; log_value_loss = 0.0
 
 
-                # --- Item Processing Block (using batch[0] as before) ---
+                
                 try:
                     # --- 1 & 2. Prompt Setup & Validation ---
                     if not isinstance(batch, list) or not batch:
@@ -682,43 +684,28 @@ class RFTTrainer(Trainer):
 
                     prompt_tokens = {k: v.to(device) for k, v in prompt_tokens_dict.items()}
                     prompt_length = prompt_tokens["input_ids"].size(1)
+                    
 
+                            
 
                     # --- 3. Generate full completion ---
-                    try:
+                    prompt_completion_ids = self.gen(model, prompt_tokens)
                         # Ensure generation config pad_token_id is valid
-                        current_pad_id = self.generation_config.pad_token_id
-                        if current_pad_id is None or current_pad_id < 0 or current_pad_id >= model_vocab_size:
-                            safe_pad_id = tokenizer.eos_token_id
-                            if safe_pad_id is None or safe_pad_id < 0 or safe_pad_id >= model_vocab_size:
-                                raise ValueError(f"Cannot generate: Invalid pad_token_id ({current_pad_id}) and invalid EOS token ({tokenizer.eos_token_id})")
-                            printc(f"Warning: Invalid pad_token_id ({current_pad_id}). Using EOS token ({safe_pad_id}) for padding during generation.", "yellow")
-                            self.generation_config.pad_token_id = safe_pad_id
+                    current_pad_id = self.generation_config.pad_token_id
+                    if current_pad_id is None or current_pad_id < 0 or current_pad_id >= model_vocab_size:
+                        safe_pad_id = tokenizer.eos_token_id
+                        if safe_pad_id is None or safe_pad_id < 0 or safe_pad_id >= model_vocab_size:
+                            raise ValueError(f"Cannot generate: Invalid pad_token_id ({current_pad_id}) and invalid EOS token ({tokenizer.eos_token_id})")
+                        printc(f"Warning: Invalid pad_token_id ({current_pad_id}). Using EOS token ({safe_pad_id}) for padding during generation.", "yellow")
+                        self.generation_config.pad_token_id = safe_pad_id
 
-                        with torch.no_grad(): # Generation should not track gradients
-                            unwrapped_model = self.accelerator.unwrap_model(model)
-                            model_device = unwrapped_model.device # Get device from actual model
-                            # Ensure inputs are on the model's device for generate
-                            prompt_tokens_model_device = {k: v.to(model_device) for k, v in prompt_tokens.items()}
-
-                            # *** Assign prompt_completion_ids here ***
-                            prompt_completion_ids = unwrapped_model.generate(
-                                **prompt_tokens_model_device,
-                                generation_config=self.generation_config,
-                                # Return dict is useful for debugging if needed, but sequence is primary output
-                                # return_dict_in_generate=True, output_scores=True # Optional for debug
-                            )
-
-                            # Validate generated IDs
-                            if prompt_completion_ids.numel() == 0:
-                                printc(f"ERROR: Generation produced empty output at step {train_step_display}!", "red"); continue
-                            min_gen_id, max_gen_id = prompt_completion_ids.min().item(), prompt_completion_ids.max().item()
-                            if min_gen_id < 0 or max_gen_id >= model_vocab_size:
-                                 printc(f"ERROR: Invalid generated token IDs (min={min_gen_id}, max={max_gen_id}) at step {train_step_display}!", "red"); continue # Skip to next item
-
-                    except Exception as gen_e:
-                        printc(f"Generation failed for item at step {train_step_display}: {gen_e}", "red")
-                        continue # Go to the next item in the dataloader
+                        
+                        # Validate generated IDs
+                        if prompt_completion_ids.numel() == 0:
+                            printc(f"ERROR: Generation produced empty output at step {train_step_display}!", "red"); continue
+                        min_gen_id, max_gen_id = prompt_completion_ids.min().item(), prompt_completion_ids.max().item()
+                        if min_gen_id < 0 or max_gen_id >= model_vocab_size:
+                                printc(f"ERROR: Invalid generated token IDs (min={min_gen_id}, max={max_gen_id}) at step {train_step_display}!", "red"); continue # Skip to next item
 
                     # --- Move generated IDs to accelerator default device and create mask ---
                     prompt_completion_ids = prompt_completion_ids.to(device)
@@ -749,6 +736,7 @@ class RFTTrainer(Trainer):
 
                     # --- 4, 5, 6. Decode, Split CoT, Split Steps ---
                     completion_ids = prompt_completion_ids[:, prompt_length:]
+                    
                     if completion_ids.shape[1] == 0:
                         printc(f"Skipping item {train_step_display}: No completion tokens generated.", "yellow"); continue
                     # Basic validation on completion IDs
@@ -760,6 +748,7 @@ class RFTTrainer(Trainer):
                         full_text = tokenizer.decode(completion_ids[0], skip_special_tokens=True, clean_up_tokenization_spaces=True)
                     except Exception as decode_e:
                          printc(f"Error decoding completion at step {train_step_display}: {decode_e}", "red"); continue
+
 
 
 
@@ -1041,10 +1030,29 @@ class RFTTrainer(Trainer):
 
                 # --- Catch errors from the entire item processing block ---
                 except Exception as item_processing_error:
-                     printc(f"Error during main processing block for item {train_step_display}: {item_processing_error}", "red")
-                     # Ensure we skip backward/optimizer step for this item
-                     perform_backward = False
-                     total_loss = None # Prevent potential use later
+                    import traceback
+                    import linecache
+                    # Walk to the last frame in the traceback
+                    tb = item_processing_error.__traceback__
+                    while tb.tb_next:
+                        tb = tb.tb_next
+
+                    # Extract filename, line number, and the source line
+                    filename = tb.tb_frame.f_code.co_filename
+                    lineno   = tb.tb_lineno
+                    code_line = linecache.getline(filename, lineno).strip()
+
+                    # Print with context
+                    printc(
+                        f"Error during main processing block for item {train_step_display} "
+                        f"at {filename}:{lineno}:\n    {code_line}\n"
+                        f"→ {item_processing_error}",
+                        "red"
+                    )
+                    # Ensure we skip backward/optimizer step for this item
+                    continue
+                    perform_backward = False
+                    total_loss = None # Prevent potential use later
 
 
                 # --- Perform Backward Pass (if loss is valid and requires grad) ---
@@ -1182,3 +1190,56 @@ class RFTTrainer(Trainer):
 
 
 # end of file
+
+
+    def gen(self, model, prompt_tokens):
+        """
+        Generate tokens for each example in prompt_tokens, appending
+        special_token_id until it appears in the sequence, then pad & return.
+        Returns None if an error occurs.
+        """
+        try:
+            special_token_id = 151668
+            pad_token_id = getattr(self, "tokenizer", model).pad_token_id
+
+            with torch.no_grad():
+                unwrapped = self.accelerator.unwrap_model(model)
+                device = unwrapped.device
+
+                batch = {k: v.to(device) for k, v in prompt_tokens.items()}
+                batch_size = batch["input_ids"].size(0)
+
+                batch_seqs = []
+
+                for i in range(batch_size):
+                    single = {k: v[i: i + 1] for k, v in batch.items()}
+
+                    seq = unwrapped.generate(
+                        **single,
+                        generation_config=self.generation_config
+                    )[0]
+
+                    while special_token_id not in seq:
+                        seq = torch.cat(
+                            [seq, torch.tensor([special_token_id], device=device)],
+                            dim=0
+                        )
+                        seq = unwrapped.generate(
+                            input_ids=seq.unsqueeze(0),
+                            generation_config=self.generation_config
+                        )[0]
+
+                    batch_seqs.append(seq)
+
+                max_len = max(s.size(0) for s in batch_seqs)
+                padded = torch.stack([
+                    F.pad(s, (0, max_len - s.size(0)), value=pad_token_id)
+                    for s in batch_seqs
+                ], dim=0)
+
+                return padded
+
+        except Exception as e:
+            print(f"Generation error: {e}")
+            return None
+

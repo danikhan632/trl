@@ -371,3 +371,11 @@ class RFTConfig(TrainingArguments):
     evaluation_strategy: str = field(default="no", metadata={"help": "Evaluation strategy."})
     save_total_limit: int = field(default=1, metadata={"help": "Total limit of saved checkpoints."})
     learning_rate: float = field(default=1e-5, metadata={"help": "Learning rate."})
+    debug_log: bool = field(
+        default=False,
+        metadata={"help": ""},
+    )
+    force_answer: str = field(
+        default="",
+        metadata={"help": ""},
+    )
