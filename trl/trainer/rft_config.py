@@ -375,7 +375,7 @@ class RFTConfig(TrainingArguments):
         default=False,
         metadata={"help": ""},
     )
-    force_answer: str = field(
-        default="",
+    force_answer: bool = field(
+        default=False,
         metadata={"help": ""},
     )

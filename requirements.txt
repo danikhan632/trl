@@ -2,3 +2,7 @@ accelerate
 datasets
 rich
 transformers>=4.46.0
+peft
+google-genai
+openai
+Pyro5

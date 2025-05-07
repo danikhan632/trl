@@ -1205,11 +1205,20 @@ class RFTTrainer(Trainer):
             with torch.no_grad():
                 unwrapped = self.accelerator.unwrap_model(model)
                 device = unwrapped.device
+                if not self.rft_config.force_answer:
+                    prompt_tokens_model_device = {k: v.to(device) for k, v in prompt_tokens.items()}
+                    prompt_completion_ids = unwrapped.generate(
+                        **prompt_tokens_model_device,
+                        generation_config=self.generation_config,
+                    )
+                    return prompt_completion_ids
 
                 batch = {k: v.to(device) for k, v in prompt_tokens.items()}
                 batch_size = batch["input_ids"].size(0)
 
                 batch_seqs = []
+
+
 
                 for i in range(batch_size):
                     single = {k: v[i: i + 1] for k, v in batch.items()}
