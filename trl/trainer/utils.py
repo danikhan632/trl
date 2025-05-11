@@ -1180,7 +1180,7 @@ def first_true_indices(bools: torch.Tensor, dtype=torch.long):
 
 
 def get_reward(
-    model: torch.nn.Module, query_responses: torch.Tensor, pad_token_id: int, context_length: int
+    model: torch.nn.Module, query_responses: torch.Tensor, pad_token_id: int, context_length: int, val_head=False, last_step=None
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Computes the reward logits and the rewards for a given model and query responses.
@@ -1208,15 +1208,21 @@ def get_reward(
     position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
     lm_backbone = getattr(model, model.base_model_prefix)
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
-    output = lm_backbone(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        return_dict=True,
-        output_hidden_states=True,
-        use_cache=False,  # otherwise mistral-based RM would error out
-    )
-    reward_logits = model.score(output.hidden_states[-1])
+
+    if val_head:
+        output = lm_backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            return_dict=True,
+            output_hidden_states=True,
+            use_cache=False,  # otherwise mistral-based RM would error out
+        )
+        reward_logits = model.v_head(output.hidden_states[-1]).squeeze(-1)
+    else:
+        # run the *reward* (sentiment) head
+        reward_logits = model.score(last_step)
+        
     sequence_lengths = first_true_indices(query_responses[:, context_length:] == pad_token_id) - 1 + context_length
     # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
     return (
@@ -1786,3 +1792,42 @@ def print_prompt_completions_sample(
     console.print(panel)
 
 
+@torch.no_grad()
+def generate_with_hidden(
+    lm_backbone: torch.nn.Module,
+    queries: torch.Tensor,
+    pad_token_id: int,
+    generation_config: GenerationConfig
+) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...]]:
+    """
+    Like `generate`, but also returns the hidden states from each generation step.
+
+    Returns:
+        - generated (torch.Tensor): concatenation of `queries` and new tokens
+        - logits (torch.Tensor): stacked scores for each newly generated token
+        - hidden_states (tuple[torch.Tensor, ...]): all hidden states returned during generation
+    """
+    # how many context tokens we started with
+    context_length = queries.shape[1]
+    # build mask & zero out padding
+    attention_mask = queries != pad_token_id
+    input_ids = torch.masked_fill(queries, ~attention_mask, 0)
+
+    # enable hidden-states in generate
+    output = lm_backbone.generate(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        generation_config=generation_config,
+        return_dict_in_generate=True,
+        output_scores=True,
+        output_hidden_states=True,   # <— here
+    )
+
+    # collect logits
+    logits = torch.stack(output.scores, dim=1)
+    # collect hidden states
+    hidden_states = output.hidden_states
+
+    # stitch context + new tokens
+    generated = torch.cat((queries, output.sequences[:, context_length:]), dim=1)
+    return generated, logits, hidden_states

@@ -14,7 +14,7 @@ from peft import (
 from trl.trainer.rft_trainer import RFTTrainer
 from trl.trainer.rft_config import RFTConfig 
 import os 
-
+os.system("clear")
 # --- Configuration ---
 # os.environ["CUDA_LAUNCH_BLOCKING"] = "1" 
 compute_dtype = torch.float16 
@@ -97,7 +97,8 @@ config.question = 'input'
 config.answer = 'solution'
 config.system_prompt = 'Solve the coding question:\n'
 config.debug_log = True
-config.max_completion_length=5000
+config.response_length=500
+config.max_completion_length=10
 
 # --- Load Dataset ---
 dataset = load_dataset("nvidia/OpenCodeReasoning", 'split_0')['split_0']

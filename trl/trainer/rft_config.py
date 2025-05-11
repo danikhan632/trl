@@ -287,7 +287,20 @@ class RFTConfig(TrainingArguments):
         default=50,
         metadata={"help": "Divisor amplifying progress effect based on raw score magnitude."},
     )
-
+    gamma: float = field(
+        default=0.1,
+        metadata={"help": "Divisor amplifying progress effect based on raw score magnitude."},
+    )
+    
+    clip_epsilon: float = field(
+        default=0.1,
+        metadata={"help": "Divisor amplifying progress effect based on raw score magnitude."},
+    )
+    
+    cliprange_value: float = field(
+        default=0.7,
+        metadata={"help": "Divisor amplifying progress effect based on raw score magnitude."},
+    )
     # Dataset Keys, Special Tokens, Prompts
     question: str = field(
         default="question",
@@ -332,7 +345,11 @@ class RFTConfig(TrainingArguments):
         default=None,
         metadata={"help": "Optional function to compute rewards."},
     )
-    
+
+    treat_last_step_terminal: bool = field(
+        default=True,
+        metadata={"help": "Use a remote inference endpoint for the reference model KL computation."},
+    )
     # Remote Reference Model Parameters
     remote_ref_model: bool = field(
         default=False,

@@ -86,6 +86,7 @@ class PolicyAndValueWrapper(nn.Module):
         super().__init__()
         self.policy = policy
         self.value_model = value_model
+        print(value_model)
         self.critic_backbone = getattr(value_model, value_model.base_model_prefix)
 
     def forward(self, **kwargs):
@@ -225,6 +226,7 @@ class PPOTrainer(Trainer):
         for module in [self.policy_model, self.ref_model, self.value_model, self.reward_model]:
             if module is not None:
                 disable_dropout_in_model(module)
+        print(self.value_model)
         self.model = PolicyAndValueWrapper(self.policy_model, self.value_model)
         self.model.config = self.policy_model.config  # needed for pushing to hub
         self.create_optimizer_and_scheduler(
@@ -444,7 +446,9 @@ class PPOTrainer(Trainer):
                             ref_output = forward(model.policy, query_response, processing_class.pad_token_id)
                     else:
                         ref_output = forward(ref_policy, query_response, processing_class.pad_token_id)
-                    ref_logits = ref_output.logits[:, context_length - 1 : -1]
+                    # print(ref_output)
+                    # ref_output= ref_output
+                    ref_logits = ref_output[0][:, context_length - 1 : -1]
                     ref_logits /= args.temperature + 1e-7
                     ref_logprob = selective_log_softmax(ref_logits, response)
                     del ref_output, ref_logits
