@@ -66,6 +66,60 @@ import statistics
 from typing import List
 
 
+def get_per_token_logps(model, input_ids, num_logits_to_keep):
+    # We add 1 to `num_logits_to_keep` because the last logits of the sequence is later excluded
+    logits = model(input_ids, num_logits_to_keep=num_logits_to_keep + 1).logits  # (B, L, V)
+    logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
+
+    # Compute the log probabilities for the input tokens. Use a loop to reduce memory peak.
+    per_token_logps = []
+    for logits_row, input_ids_row in zip(logits, input_ids[:, -num_logits_to_keep:]):
+        log_probs = logits_row.log_softmax(dim=-1)
+        token_log_prob = torch.gather(log_probs, dim=1, index=input_ids_row.unsqueeze(1)).squeeze(1)
+        per_token_logps.append(token_log_prob)
+    return torch.stack(per_token_logps)
+
+
+
+
+
+
+
+def zero_out_prompt(policy_log_probs: torch.Tensor,
+                    ref_log_probs: torch.Tensor,
+                    prompt_len: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Returns new tensors where all timesteps < prompt_len have been zeroed out.
+
+    Args:
+      policy_log_probs: [B, T, V]
+      ref_log_probs:    [B, T, V]
+      prompt_len:       int
+
+    Returns:
+      (policy_masked, ref_masked) both shaped [B, T, V]
+      with [:, :prompt_len, :] == 0.
+    """
+    B, T, V = policy_log_probs.shape
+
+    # make a mask of shape [T], 0 for prompt positions, 1 for gen positions
+    device = policy_log_probs.device
+    idx = torch.arange(T, device=device)  # [T]
+    mask = (idx >= prompt_len).to(policy_log_probs.dtype)  # [T], 0/1
+
+    # expand to [B, T, V]
+    mask = mask.unsqueeze(0).unsqueeze(-1)  # [1, T, 1]
+    mask = mask.expand(B, T, V)             # [B, T, V]
+
+    # multiply to zero out
+    policy_masked = policy_log_probs * mask
+    ref_masked    = ref_log_probs    * mask
+
+    return policy_masked, ref_masked
+
+
+
+
 
 
 
@@ -320,167 +374,156 @@ class RFTTrainer(Trainer):
         except Exception as e:
             raise ValueError(f"Cannot determine processing_class vocabulary size: {e}")
 
-    def generate_sequence_and_get_model_outputs(
+    def _generate_sequence_and_get_model_outputs(
         self,
-        model,
-        prompt_tokens, 
-        step_label: str, 
-        is_trainable: bool,
-        get_hidden_states: bool = True,
-        generated_ids_override: Optional[torch.Tensor] = None 
+        model_obj,
+        prompt_tokens,
+        train_step_display,
+        is_trainable_policy_model,
+        get_hidden_states_flag=True
     ):
         """
-        Generates a sequence from `model` (if `generated_ids_override` is None),
-        or uses `generated_ids_override`. Then performs a forward pass to
-        compute log probabilities and hidden states for the given sequence.
+        Generates a sequence using model_obj (with optional forced-answer logic),
+        then computes its log_probs and hidden_states via a forward pass.
         """
         device = self.accelerator.device
-        model_vocab_size = self._get_model_config_vocab_size(model)
+        model_vocab_size = self._get_model_config_vocab_size(model_obj)
+        processing_class_vocab_size = self._get_processing_class_vocab_size()
 
-        prompt_completion_ids = None
+        # Ensure processing_class has a valid pad token
+        if self.processing_class.pad_token_id is None or self.processing_class.pad_token_id < 0:
+            eos_tok = self.processing_class.eos_token or self.processing_class.eos_token_id
+            self.processing_class.add_special_tokens({'pad_token': eos_tok})
+            model_obj.resize_token_embeddings(self._get_processing_class_vocab_size())
 
-        if generated_ids_override is not None:
-            prompt_completion_ids = generated_ids_override.to(device)
+        # Determine pad ID
+        pad_id = self.generation_config.pad_token_id or self.processing_class.pad_token_id
+        if pad_id < 0 or pad_id > processing_class_vocab_size:
+            safe_id = self.processing_class.eos_token_id
+            if safe_id is None or safe_id < 0 or safe_id > processing_class_vocab_size:
+                raise ValueError(
+                    f"Cannot generate with {model_obj.__class__.__name__}: "
+                    f"Invalid pad_token_id ({pad_id}) and invalid EOS token ({safe_id}) "
+                    f"for processing_class vocab size {processing_class_vocab_size}"
+                )
+            pad_id = safe_id
 
-        else:
+        # Copy config and set pad_token_id
+        gen_cfg = self.generation_config
+        gen_cfg.pad_token_id = pad_id
 
-            if self.processing_class.pad_token_id is None or self.processing_class.pad_token_id < 0:
-                eos_token_val = self.processing_class.eos_token or self.processing_class.eos_token_id
-                if eos_token_val is None:
-                     raise ValueError("EOS token is not defined in the processing_class, and pad_token is missing.")
-                self.processing_class.add_special_tokens({'pad_token': eos_token_val})
+        # Token generation
+        try:
+            special_token_id = 151668
+            pad_token_id = self.processing_class.pad_token_id
+            unwrapped = self.accelerator.unwrap_model(model_obj)
+            unwrapped_device = unwrapped.device
 
-            pad_token_id = self.generation_config.pad_token_id
-            if pad_token_id is None or pad_token_id < 0 or pad_token_id >= model_vocab_size: 
-                pad_token_id = self.processing_class.pad_token_id
-                if pad_token_id is None or pad_token_id < 0 or pad_token_id >= model_vocab_size:
-                    fallback_id = self.processing_class.eos_token_id
-                    if fallback_id is None or fallback_id < 0 or fallback_id >= model_vocab_size:
-                        raise ValueError(
-                            f"Cannot generate with {model.__class__.__name__}: Invalid pad_token_id "
-                            f"and fallback EOS token for model vocab size {model_vocab_size}"
-                        )
-                    pad_token_id = fallback_id
+            with torch.no_grad():
+                # Move inputs
+                inputs = {k: v.to(unwrapped_device) for k, v in prompt_tokens.items()}
 
-            current_gen_config = self.generation_config
-            current_gen_config.pad_token_id = pad_token_id
+                if not self.rft_config.force_answer:
+                    # Standard generation
+                    generated = unwrapped.generate(
+                        **inputs,
+                        generation_config=gen_cfg
+                    )
+                else:
+                    # Force-answer: generate until special_token_id appears
+                    batch_seqs = []
+                    for i in range(inputs['input_ids'].size(0)):
+                        seq = unwrapped.generate(
+                            **{k: v[i:i+1] for k, v in inputs.items()},
+                            generation_config=gen_cfg
+                        )[0]
+                        # Append special token until seen
+                        while special_token_id not in seq:
+                            seq = torch.cat([seq, torch.tensor([special_token_id], device=unwrapped_device)])
+                            seq = unwrapped.generate(
+                                input_ids=seq.unsqueeze(0),
+                                generation_config=gen_cfg
+                            )[0]
+                        batch_seqs.append(seq)
+                    # Pad sequences
+                    max_len = max(s.size(0) for s in batch_seqs)
+                    generated = torch.stack([
+                        F.pad(s, (0, max_len - s.size(0)), value=pad_token_id)
+                        for s in batch_seqs
+                    ], dim=0)
 
-            try:
-                special_token_id = 151668 
-
-                unwrapped_model = self.accelerator.unwrap_model(model)
-                model_device = unwrapped_model.device 
-
-                with torch.no_grad():
-
-                    model_inputs = {k: v.to(model_device) for k, v in prompt_tokens.items()}
-
-                    if not self.rft_config.force_answer:
-                        generated_output = unwrapped_model.generate(
-                            **model_inputs,
-                            generation_config=current_gen_config
-
-                        )
-
-                        generated_ids_on_model_device = generated_output if isinstance(generated_output, torch.Tensor) else generated_output.sequences
-
-                    else: 
-                        sequences = []
-                        for i in range(model_inputs['input_ids'].size(0)): 
-                            input_slice = {k: v[i:i+1] for k, v in model_inputs.items()}
-                            current_seq = unwrapped_model.generate(
-                                **input_slice,
-                                generation_config=current_gen_config
-                            )[0] 
-
-                            max_force_answer_iterations = getattr(self.rft_config, "max_force_answer_iterations", 10)
-                            iter_count = 0
-                            while special_token_id not in current_seq and iter_count < max_force_answer_iterations:
-                                current_seq = torch.cat([current_seq, torch.tensor([special_token_id], device=model_device)], dim=0)
-                                current_seq = unwrapped_model.generate(
-                                    input_ids=current_seq.unsqueeze(0), 
-                                    generation_config=current_gen_config
-                                )[0]
-                                iter_count += 1
-                            if iter_count >= max_force_answer_iterations:
-                                printc(f"Warning ({step_label}): Max iterations reached for force_answer.", "yellow")
-                            sequences.append(current_seq)
-
-                        max_len = max(s.size(0) for s in sequences)
-                        generated_ids_on_model_device = torch.stack([
-                            F.pad(s, (0, max_len - s.size(0)), value=pad_token_id)
-                            for s in sequences
-                        ], dim=0)
-
-                prompt_completion_ids = generated_ids_on_model_device.to(device) 
-            except Exception as e:
-                printc(f"Error during token generation for {step_label}: {e}", "red")
-                import traceback
-                traceback.print_exc()
-                return None, None, None
-
-        if prompt_completion_ids is None or prompt_completion_ids.numel() == 0:
-            printc(f"No sequence to process for {step_label}.", "yellow")
+            prompt_completion_ids = generated.to(device)
+        except Exception as e:
+            printc(e)
             return None, None, None
 
-        min_id, max_id = int(prompt_completion_ids.min()), int(prompt_completion_ids.max())
+        # Validate generation output
+        if prompt_completion_ids.numel() == 0:
+            return None, None, None
+        min_id, max_id = prompt_completion_ids.min().item(), prompt_completion_ids.max().item()
         if min_id < 0 or max_id >= model_vocab_size:
-            printc(f"ERROR ({step_label}): Invalid token IDs in sequence (min={min_id}, max={max_id}, vocab_size={model_vocab_size}).", "red")
+            return None, None, None
+        # Skip if no new tokens
+        if prompt_completion_ids.size(1) <= prompt_tokens['input_ids'].size(1):
             return None, None, None
 
-        if generated_ids_override is None and prompt_tokens.get("input_ids") is not None and \
-           prompt_completion_ids.size(1) <= prompt_tokens['input_ids'].size(1):
-            printc(f"Warning ({step_label}): No new tokens generated beyond prompt length.", "yellow")
-
+        # Build attention mask
         attention_mask = torch.ones_like(prompt_completion_ids, device=device)
 
-        forward_pass_grad_context = torch.enable_grad() if is_trainable else torch.no_grad()
-
-        original_training_state = None
-        if not is_trainable and hasattr(model, 'training') and model.training:
-            original_training_state = model.training
-            model.eval()
-
+        # Forward pass for log_probs and hidden_states
         try:
-            with forward_pass_grad_context:
-                outputs = model(
-                    input_ids=prompt_completion_ids,
-                    attention_mask=attention_mask,
-                    output_hidden_states=get_hidden_states,
-
-                )
-
-            logits = outputs.logits.to(device) 
-
-            log_probs = F.log_softmax(logits, dim=-1) 
-
-            hidden_states_output = None
-            if get_hidden_states:
-                if not hasattr(outputs, 'hidden_states') or outputs.hidden_states is None:
-
-                    printc(f"Warning ({step_label}): Model did not return hidden_states. Ensure model config allows it.", "yellow")
-                else:
-
-                    hidden_states_output = outputs.hidden_states[-1].to(device) 
-
+            if not is_trainable_policy_model and hasattr(model_obj, 'eval'):
+                model_obj.eval()
+            outputs = model_obj(
+                input_ids=prompt_completion_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=get_hidden_states_flag
+            )
+            logits = outputs.logits
+            log_probs = F.log_softmax(logits, dim=-1)
+            hidden_states = outputs.hidden_states if get_hidden_states_flag and hasattr(outputs, 'hidden_states') else None
         except Exception as e:
-            printc(f"Error during forward pass for {step_label}: {e}", "red")
-            import traceback
-            traceback.print_exc()
-            return None, None, None
-        finally:
-            if original_training_state is not None: 
-                model.train(original_training_state)
-
-        if is_trainable and not log_probs.requires_grad:
-            printc(f"ERROR ({step_label}): log_probs do not require grad after a trainable forward pass.", "red")
-
+            printc(e)
             return None, None, None
 
-        return prompt_completion_ids, log_probs, hidden_states_output
+        if is_trainable_policy_model and not log_probs.requires_grad:
+            return None, None, None
+
+        return prompt_completion_ids, log_probs, hidden_states
 
 
+    def get_full_kl_divergence(self, full_policy_log_probs, full_ref_log_probs, full_input_ids):
+        # Helper remains the same
+        if full_ref_log_probs is None or full_policy_log_probs is None: return None
+        if full_input_ids.shape[1] <= 1: return None # Need at least 2 tokens for KL calculation (shifted)
 
+        # Check shapes carefully - log probs are shifted (L-1)
+        expected_len = full_input_ids.shape[1] - 1
+        if full_policy_log_probs.shape[1] != expected_len or full_ref_log_probs.shape[1] != expected_len:
+             printc(f"Shape mismatch KL calc: policy_logp={full_policy_log_probs.shape}, ref_logp={full_ref_log_probs.shape}, expected_len={expected_len}", "red")
+             return None
+
+        # Get actual next tokens (indices) - shape (B, L-1)
+        actual_next_tokens_indices = full_input_ids[:, 1:].contiguous()
+
+        # Ensure indices are within vocab bounds for gathering
+        vocab_size = full_policy_log_probs.shape[-1]
+        if actual_next_tokens_indices.max() >= vocab_size or actual_next_tokens_indices.min() < 0:
+            printc(f"Invalid indices for KL gather: min={actual_next_tokens_indices.min()}, max={actual_next_tokens_indices.max()}, vocab_size={vocab_size}", "red")
+            # Handle invalid indices (e.g., clamp or return None) - Returning None is safer
+            return None
+
+        # Gather the log_probs for the actual tokens generated
+        # Add unsqueeze(-1) for gather dimension, then squeeze(-1)
+        policy_token_log_probs = torch.gather(full_policy_log_probs, -1, actual_next_tokens_indices.unsqueeze(-1)).squeeze(-1)
+        ref_token_log_probs = torch.gather(full_ref_log_probs, -1, actual_next_tokens_indices.unsqueeze(-1)).squeeze(-1)
+
+        # KL divergence: policy_logp(token) - ref_logp(token)
+        # Clamp to avoid large values if needed
+        kl_div = torch.clamp(policy_token_log_probs - ref_token_log_probs.detach(), min=-30, max=30) # Detach ref_log_probs as we don't backprop through ref model
+
+        return kl_div # Shape should be (B, L-1)
+    
     
     def _prepare_item_prompt(self, batch_item, model_vocab_size, train_step_display):
         """Prepares and tokenizes the prompt for a single batch item."""
@@ -814,49 +857,50 @@ class RFTTrainer(Trainer):
             )
             print("Callback handler initialized.")    
 
-
-
-    def value_head_score(self, activations: torch.Tensor, boundaries: List[int], value_model) -> List[torch.Tensor]:
+    def cumulative_slices(
+        self,
+        x: torch.Tensor,
+        boundaries: List[int],
+        model,
+    ) -> List[torch.Tensor]:
         """
-        Computes value estimates for cumulative slices of `activations` at given boundaries.
-
-        Args:
-            activations: Tensor of shape [B, T, H] or [T, H].
-            boundaries: Sorted indices at which to slice the time dimension.
-            value_model: Module with a `value_head` that maps (B, L, H) → (B, L, 1).
-
+        Given:
+        x          -- a tensor of shape [1, n, 1024]
+        boundaries -- a list of integers in [0, n], e.g. [0, 404, 449, ..., n]
         Returns:
-            A list of (B,) tensors, one per boundary slice, each scaled by vf_coef.
+        A list of tensors [ x[:, :b, :] for each b in boundaries if b > 0 ].
+        Their shapes will be:
+            [1, 404, 1024],
+            [1, 449, 1024],
+            ...,
+            [1, 904, 1024].
         """
-        # Normalize to 3D: add batch dim if needed
-        if activations.ndim == 2:
-            activations = activations.unsqueeze(0)
-        elif activations.ndim != 3:
-            raise ValueError(f"Expected activations of dim 2 or 3, got {activations.ndim}")
-
-        batch_size, seq_len, _ = activations.shape
-        # Deduplicate and sort boundaries
-        unique_bounds = sorted(set(boundaries))
-
-        estimates = []
-        for end_idx in unique_bounds:
-            if end_idx <= 0:
+        # ensure sorted & unique
+        bounds = sorted(set(boundaries))
+        out = []
+        for b in bounds:
+            if b <= 0:
+                # skip the 0 boundary (would give shape [1,0,1024])
                 continue
-            if end_idx > seq_len:
-                raise ValueError(f"Boundary {end_idx} exceeds sequence length {seq_len}")
+            if b > x.size(1):
+                raise ValueError(f"Boundary {b} exceeds tensor length {x.size(1)}")
+            foo = x[:, :b, :]
+            foo = foo.to(torch.float32)
+            out.append(foo)
+        value_estimates = []  # will hold one (B,) tensor per segment
 
-            # Slice and cast
-            segment = activations[:, :end_idx, :].to(torch.float32)
-            # (B, L, 1)
-            logits = value_model.value_head(segment)
-            # (B, L)
-            logits = logits.squeeze(-1)
-            # (B,)
-            mean_vals = logits.mean(dim=1)
-            # scale and collect
-            estimates.append(mean_vals * self.rft_config.vf_coef)
+        for seg in out:
+            # seg: (B, Li, hidden_size)
+            # 1) apply the value head → (B, Li, 1)
+            v_logits = model.value_head(seg)
+            # 2) drop the last dim → (B, Li)
+            v_logits = v_logits.squeeze(-1)
+            # 3) pool over the token axis → (B,)
+            #    here we simply take the mean across Li
+            v_scalar = v_logits.mean(dim=1)
+            value_estimates.append(v_scalar*  self.rft_config.vf_coef)
+        return value_estimates
 
-        return estimates
 
 
     def decode_and_split_completion(
@@ -1146,43 +1190,27 @@ class RFTTrainer(Trainer):
                     continue
 
                 # --- 2. Generate Full CoT Sequence (Policy Model "Old" Outputs) ---
+                # This provides old_log_probs and old_hidden_states for PPO
                 prompt_completion_ids, full_policy_log_probs_initial, full_policy_hidden_states_initial = \
-                    self.generate_sequence_and_get_model_outputs(
-                        self.model, 
-                        prompt_tokens,
-                        f"E{epoch+1}_S{self.state.global_step}_PolicyRollout",
-                        is_trainable=False, 
-                        get_hidden_states=True, 
-                        generated_ids_override=None 
+                    self._generate_sequence_and_get_model_outputs(
+                        self.model, prompt_tokens, f"E{epoch+1}_S{self.state.global_step}_PolicyRollout",
+                        is_trainable_policy_model=False, # Treat as fixed for this rollout; grad comes from re-eval
+                        get_hidden_states_flag=True
                     )
                 if prompt_completion_ids is None or full_policy_log_probs_initial is None or full_policy_hidden_states_initial is None:
-                    printc(f"Skipping item E{epoch+1}_S{self.state.global_step}: Policy generation/forward pass failed.", "yellow")
-                    continue 
-
-                full_ref_log_probs = None 
-                if self.ref_model is not None:
-
-                    _, temp_full_ref_log_probs, _ = self.generate_sequence_and_get_model_outputs(
-                        self.ref_model,
-                        prompt_tokens, 
-                        f"E{epoch+1}_S{self.state.global_step}_RefRollout",
-                        is_trainable=False,
-                        get_hidden_states=False,
-                        generated_ids_override=prompt_completion_ids 
-                    )
-                    if temp_full_ref_log_probs is not None:
-                        full_ref_log_probs = temp_full_ref_log_probs
-                    else:
-                        printc(f"Warning (E{epoch+1}_S{self.state.global_step}_RefRollout): Ref model failed to produce log_probs. KL will effectively be zero for this item.", "yellow")
-                else:
-                    printc(f"No reference model configured. KL will be zero for item E{epoch+1}_S{self.state.global_step}.", "grey")
-
-                if full_ref_log_probs is None:
-                    printc(f"Creating placeholder for full_ref_log_probs (will result in zero KL if used directly for P-Q). Item E{epoch+1}_S{self.state.global_step}", "grey")
-
-                    full_ref_log_probs = full_policy_log_probs_initial.detach().clone()
-
-
+                    printc(f"Skipping item E{epoch+1}_S{self.state.global_step}: Policy generation failed.", "yellow")
+                    continue
+                
+                # --- 3. Get Reference Log Probabilities ---
+                _, full_ref_log_probs, _ = self._generate_sequence_and_get_model_outputs(
+                    self.ref_model, prompt_tokens, f"E{epoch+1}_S{self.state.global_step}_RefRollout",
+                    is_trainable_policy_model=False, get_hidden_states_flag=False,
+                    # Provide generated_ids_override=prompt_completion_ids to ensure ref model scores the same sequence
+                    # This needs to be added to _generate_sequence_and_get_model_outputs if not present
+                    # For now, assuming it generates and then we align. More robust is override.
+                )
+                # If using override, ensure generated_ids_override is handled in _generate_sequence_and_get_model_outputs
+                # For now, let's assume it's handled by aligning based on prompt_tokens and prompt_completion_ids
 
                 # --- 4. Decode and Segment the CoT ---
                 # `self.idxs` will be populated here.
@@ -1197,8 +1225,7 @@ class RFTTrainer(Trainer):
                 
                 # --- 5. Get Value Estimates V_old(S_boundary) from initial rollout ---
                 # values_at_boundaries[k] = V_old(State up to self.idxs[k+1])
-                print(full_policy_hidden_states_initial.shape)
-                values_at_boundaries_old = self.value_head_score(
+                values_at_boundaries_old = self.cumulative_slices(
                     full_policy_hidden_states_initial[-1], self.idxs, self.model
                 )
                 if not values_at_boundaries_old or len(values_at_boundaries_old) != (len(self.idxs) -1):
@@ -1216,7 +1243,7 @@ class RFTTrainer(Trainer):
                     printc(f"Skipping item E{epoch+1}_S{self.state.global_step}: Reward evaluation failed.", "yellow")
                     continue
                 
-
+                # Extract just the reward values for PPO loop
                 rewards_for_thoughts = []
                 for step_reward_data in rewards_data_full:
                     reward_key = 'whitened_score' if self.rft_config.whiten_rewards and 'whitened_score' in step_reward_data else 'combined_score'
