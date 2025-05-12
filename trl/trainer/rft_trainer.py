@@ -66,60 +66,6 @@ import statistics
 from typing import List
 
 
-def get_per_token_logps(model, input_ids, num_logits_to_keep):
-    # We add 1 to `num_logits_to_keep` because the last logits of the sequence is later excluded
-    logits = model(input_ids, num_logits_to_keep=num_logits_to_keep + 1).logits  # (B, L, V)
-    logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
-
-    # Compute the log probabilities for the input tokens. Use a loop to reduce memory peak.
-    per_token_logps = []
-    for logits_row, input_ids_row in zip(logits, input_ids[:, -num_logits_to_keep:]):
-        log_probs = logits_row.log_softmax(dim=-1)
-        token_log_prob = torch.gather(log_probs, dim=1, index=input_ids_row.unsqueeze(1)).squeeze(1)
-        per_token_logps.append(token_log_prob)
-    return torch.stack(per_token_logps)
-
-
-
-
-
-
-
-def zero_out_prompt(policy_log_probs: torch.Tensor,
-                    ref_log_probs: torch.Tensor,
-                    prompt_len: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Returns new tensors where all timesteps < prompt_len have been zeroed out.
-
-    Args:
-      policy_log_probs: [B, T, V]
-      ref_log_probs:    [B, T, V]
-      prompt_len:       int
-
-    Returns:
-      (policy_masked, ref_masked) both shaped [B, T, V]
-      with [:, :prompt_len, :] == 0.
-    """
-    B, T, V = policy_log_probs.shape
-
-    # make a mask of shape [T], 0 for prompt positions, 1 for gen positions
-    device = policy_log_probs.device
-    idx = torch.arange(T, device=device)  # [T]
-    mask = (idx >= prompt_len).to(policy_log_probs.dtype)  # [T], 0/1
-
-    # expand to [B, T, V]
-    mask = mask.unsqueeze(0).unsqueeze(-1)  # [1, T, 1]
-    mask = mask.expand(B, T, V)             # [B, T, V]
-
-    # multiply to zero out
-    policy_masked = policy_log_probs * mask
-    ref_masked    = ref_log_probs    * mask
-
-    return policy_masked, ref_masked
-
-
-
-
 
 
 
