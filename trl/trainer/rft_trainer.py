@@ -374,6 +374,11 @@ class RFTTrainer(Trainer):
         except Exception as e:
             raise ValueError(f"Cannot determine processing_class vocabulary size: {e}")
 
+
+
+
+
+
     def _generate_sequence_and_get_model_outputs(
         self,
         model_obj,
@@ -454,76 +459,110 @@ class RFTTrainer(Trainer):
 
             prompt_completion_ids = generated.to(device)
         except Exception as e:
-            printc(e)
+            printc(f"Error in generation for {train_step_display}: {e}", "red")
             return None, None, None
 
         # Validate generation output
         if prompt_completion_ids.numel() == 0:
+            printc(f"Empty prompt_completion_ids for {train_step_display}", "yellow")
             return None, None, None
         min_id, max_id = prompt_completion_ids.min().item(), prompt_completion_ids.max().item()
         if min_id < 0 or max_id >= model_vocab_size:
+            printc(f"Invalid token IDs (min={min_id}, max={max_id}) for {train_step_display}", "red")
             return None, None, None
-        # Skip if no new tokens
         if prompt_completion_ids.size(1) <= prompt_tokens['input_ids'].size(1):
+            printc(f"No new tokens generated for {train_step_display}", "yellow")
             return None, None, None
 
-        # Build attention mask
+
         attention_mask = torch.ones_like(prompt_completion_ids, device=device)
 
-        # Forward pass for log_probs and hidden_states
+        # Forward pass for log probs and hidden states
         try:
             if not is_trainable_policy_model and hasattr(model_obj, 'eval'):
                 model_obj.eval()
-            outputs = model_obj(
-                input_ids=prompt_completion_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=get_hidden_states_flag
-            )
-            logits = outputs.logits
-            log_probs = F.log_softmax(logits, dim=-1)
-            hidden_states = outputs.hidden_states if get_hidden_states_flag and hasattr(outputs, 'hidden_states') else None
-        except Exception as e:
-            printc(e)
-            return None, None, None
+            # Perform forward pass in FP32 to avoid FP16 overflow
+            with torch.autocast(device_type='cuda', dtype=torch.float32, enabled=False):
+                outputs = model_obj(
+                    input_ids=prompt_completion_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=get_hidden_states_flag
+                )
+                # Ensure logits are in FP32 and clip them to a safe range
+                logits = outputs.logits.float()  # Convert to FP32
+                logits = torch.clamp(logits, min=-1e4, max=1e4)  # Prevent extreme values
+                # Apply temperature scaling safely
+                logits = logits / (self.rft_config.temperature + 1e-7)  # Add small epsilon to avoid division by zero
+                log_probs = F.log_softmax(logits, dim=-1)  # Compute log probabilities
+                hidden_states = outputs.hidden_states if get_hidden_states_flag and hasattr(outputs, 'hidden_states') else None
 
-        if is_trainable_policy_model and not log_probs.requires_grad:
+                # Check for numerical issues
+                if torch.isnan(log_probs).any() or torch.isinf(log_probs).any():
+                    print(f"NaN/Inf in log probs for {train_step_display}")
+                    return None, None, None
+        except Exception as e:
+            print(f"Error in forward pass for {train_step_display}: {e}")
             return None, None, None
 
         return prompt_completion_ids, log_probs, hidden_states
 
 
     def get_full_kl_divergence(self, full_policy_log_probs, full_ref_log_probs, full_input_ids):
-        # Helper remains the same
-        if full_ref_log_probs is None or full_policy_log_probs is None: return None
-        if full_input_ids.shape[1] <= 1: return None # Need at least 2 tokens for KL calculation (shifted)
+        """
+        Computes the KL divergence between policy and reference log probabilities for a sequence,
+        using the k3 estimator for lower variance.
 
-        # Check shapes carefully - log probs are shifted (L-1)
+        Args:
+            full_policy_log_probs: torch.Tensor, shape (B, L-1, V), log probabilities from policy model
+            full_ref_log_probs: torch.Tensor, shape (B, L-1, V), log probabilities from reference model
+            full_input_ids: torch.Tensor, shape (B, L), input token IDs
+
+        Returns:
+            torch.Tensor, shape (B, L-1), per-token KL divergence, or None if invalid input
+        """
+        if full_ref_log_probs is None or full_policy_log_probs is None:
+            return None
+        if full_input_ids.shape[1] <= 1:
+            return None  # Need at least 2 tokens for KL calculation (shifted)
+
+        # Check shapes: log probs are shifted (L-1)
         expected_len = full_input_ids.shape[1] - 1
         if full_policy_log_probs.shape[1] != expected_len or full_ref_log_probs.shape[1] != expected_len:
-             printc(f"Shape mismatch KL calc: policy_logp={full_policy_log_probs.shape}, ref_logp={full_ref_log_probs.shape}, expected_len={expected_len}", "red")
-             return None
+            printc(f"Shape mismatch KL calc: policy_logp={full_policy_log_probs.shape}, ref_logp={full_ref_log_probs.shape}, expected_len={expected_len}", "red")
+            return None
 
         # Get actual next tokens (indices) - shape (B, L-1)
         actual_next_tokens_indices = full_input_ids[:, 1:].contiguous()
 
-        # Ensure indices are within vocab bounds for gathering
+        # Ensure indices are within vocab bounds
         vocab_size = full_policy_log_probs.shape[-1]
         if actual_next_tokens_indices.max() >= vocab_size or actual_next_tokens_indices.min() < 0:
             printc(f"Invalid indices for KL gather: min={actual_next_tokens_indices.min()}, max={actual_next_tokens_indices.max()}, vocab_size={vocab_size}", "red")
-            # Handle invalid indices (e.g., clamp or return None) - Returning None is safer
             return None
 
-        # Gather the log_probs for the actual tokens generated
-        # Add unsqueeze(-1) for gather dimension, then squeeze(-1)
-        policy_token_log_probs = torch.gather(full_policy_log_probs, -1, actual_next_tokens_indices.unsqueeze(-1)).squeeze(-1)
-        ref_token_log_probs = torch.gather(full_ref_log_probs, -1, actual_next_tokens_indices.unsqueeze(-1)).squeeze(-1)
+        # Create padding mask to exclude pad tokens
+        pad_token_id = self.processing_class.pad_token_id or self.processing_class.eos_token_id
+        padding_mask = (actual_next_tokens_indices != pad_token_id)  # Shape (B, L-1)
 
-        # KL divergence: policy_logp(token) - ref_logp(token)
-        # Clamp to avoid large values if needed
-        kl_div = torch.clamp(policy_token_log_probs - ref_token_log_probs.detach(), min=-30, max=30) # Detach ref_log_probs as we don't backprop through ref model
+        # Gather log probabilities for the actual tokens
+        policy_token_log_probs = torch.gather(full_policy_log_probs, -1, actual_next_tokens_indices.unsqueeze(-1)).squeeze(-1)  # Shape (B, L-1)
+        ref_token_log_probs = torch.gather(full_ref_log_probs, -1, actual_next_tokens_indices.unsqueeze(-1)).squeeze(-1)  # Shape (B, L-1)
 
-        return kl_div # Shape should be (B, L-1)
-    
+        # Check for NaN/Inf
+        if torch.isnan(policy_token_log_probs).any() or torch.isinf(policy_token_log_probs).any() or \
+        torch.isnan(ref_token_log_probs).any() or torch.isinf(ref_token_log_probs).any():
+            printc("NaN/Inf detected in log probabilities", "red")
+            return None
+
+        # Compute KL divergence using k3 estimator: (exp(log Q - log P) - 1) - (log Q - log P)
+        log_ratio = ref_token_log_probs.detach() - policy_token_log_probs  # Shape (B, L-1)
+        kl_div = (torch.exp(log_ratio) - 1) - log_ratio  # Shape (B, L-1)
+        kl_div = torch.clamp(kl_div, min=-10, max=10)  # Tighter clamping for stability
+        kl_div = torch.where(padding_mask, kl_div, torch.tensor(0.0, device=kl_div.device))  # Mask padding tokens
+
+        return kl_div  # Shape (B, L-1)
+
+
     
     def _prepare_item_prompt(self, batch_item, model_vocab_size, train_step_display):
         """Prepares and tokenizes the prompt for a single batch item."""
@@ -1028,104 +1067,82 @@ class RFTTrainer(Trainer):
         self.idxs=[]
         self.hidden_states=[]
 
+
+
     def _get_new_logprobs_value_and_kl_for_thought_segment(
         self,
-        policy_model_current, # current self.model (policy + value head)
-        ref_model_current,    # self.ref_model
-        full_generated_ids: torch.Tensor, # tensor (1, full_len), e.g., prompt_completion_ids
-        segment_prompt_and_thought_start_idx: int, # Index in full_generated_ids where the relevant prompt part for this thought begins
-        segment_action_start_idx: int,   # Index in full_generated_ids where the current action (thought tokens) begins
-        segment_action_end_idx: int,     # Index in full_generated_ids where the current action (thought tokens) ends
+        policy_model_current,  # current self.model (policy + value head)
+        ref_model_current,     # self.ref_model
+        full_generated_ids: torch.Tensor,  # tensor (B, L), e.g., prompt_completion_ids
+        segment_prompt_and_thought_start_idx: int,  # Index where the relevant prompt part begins
+        segment_action_start_idx: int,  # Index where the current action (thought tokens) begins
+        segment_action_end_idx: int,    # Index where the current action (thought tokens) ends
+        full_policy_log_probs: torch.Tensor,  # Precomputed log probs, shape (B, L, V)
+        full_hidden_states: torch.Tensor,     # Precomputed hidden states, shape (B, L, hidden_size)
     ):
         """
-        Performs a forward pass for a given segment to get new logprobs for the action,
-        a new value estimate for the state *before* the action, and KL divergence for the action.
+        Extracts log probs and value estimate for a segment using precomputed outputs,
+        and computes KL divergence for the action.
+
+        Args:
+            policy_model_current: PreTrainedModel, current policy model
+            ref_model_current: PreTrainedModel, reference model
+            full_generated_ids: torch.Tensor, shape (B, L), full sequence of token IDs
+            segment_prompt_and_thought_start_idx: int, start index of context
+            segment_action_start_idx: int, start index of action tokens
+            segment_action_end_idx: int, end index of action tokens
+            full_policy_log_probs: torch.Tensor, shape (B, L, V), precomputed policy log probs
+            full_hidden_states: torch.Tensor, shape (B, L, hidden_size), precomputed hidden states
+
+        Returns:
+            Tuple of (new_action_log_probs_sum, new_V_S_prev_recomputed, kl_for_action_sum)
         """
         device = self.accelerator.device
 
         # 1. Prepare inputs
-        action_tokens = full_generated_ids[:, segment_action_start_idx:segment_action_end_idx]
+        action_tokens = full_generated_ids[:, segment_action_start_idx:segment_action_end_idx]  # Shape (B, action_len)
         if action_tokens.size(1) == 0:
-            return (torch.tensor(0.0, device=device, requires_grad=True),
-                    torch.tensor(0.0, device=device, requires_grad=True),
-                    torch.tensor(0.0, device=device)) # Zero loss contribution
-
-        # Input for the forward pass: from where the relevant context for this thought starts, up to its end
-        # This ensures hidden states are computed correctly for value and policy logits.
-        input_ids_for_segment_forward = full_generated_ids[:, segment_prompt_and_thought_start_idx:segment_action_end_idx]
-        attention_mask_for_segment_forward = torch.ones_like(input_ids_for_segment_forward, device=device)
-
-        # Determine relative start of action within input_ids_for_segment_forward
-        relative_action_start_idx = segment_action_start_idx - segment_prompt_and_thought_start_idx
-        
-        # 2. Forward pass with current policy model
-        # Ensure gradients are enabled if in training mode
-        grad_context = torch.enable_grad() if policy_model_current.training else torch.no_grad()
-        with grad_context:
-            outputs = policy_model_current(
-                input_ids=input_ids_for_segment_forward,
-                attention_mask=attention_mask_for_segment_forward,
-                output_hidden_states=True  # Ensure hidden states are output
+            return (
+                torch.tensor(0.0, device=device, requires_grad=True),
+                torch.tensor(0.0, device=device, requires_grad=True),
+                torch.tensor(0.0, device=device)
             )
-            all_logits_segment = outputs.logits  # (1, len(segment_forward), vocab_size)
-            # Ensure hidden_states are available
-            if not hasattr(outputs, 'hidden_states') or outputs.hidden_states is None:
-                raise RuntimeError("Model did not return hidden_states. Ensure `output_hidden_states=True` is effective.")
-            all_hidden_states_segment = outputs.hidden_states[-1]  # (1, len(segment_forward), hidden_size)
 
-        # 3. Extract new policy log probabilities for the action_tokens
-        # Logits for predicting action_tokens[j] are at all_logits_segment[:, relative_action_start_idx + j -1, :]
-        logits_for_action = all_logits_segment[:, (relative_action_start_idx -1) : (relative_action_start_idx + action_tokens.size(1) -1) , :]
-        
-        log_probs_dist_new = F.log_softmax(logits_for_action, dim=-1)
-        new_action_log_probs_per_token = torch.gather(log_probs_dist_new, -1, action_tokens.unsqueeze(-1)).squeeze(-1)
+        # Relative start of action within the sequence
+        relative_action_start_idx = segment_action_start_idx - segment_prompt_and_thought_start_idx
+
+        # 2. Extract policy log probabilities
+        log_probs_dist_new = full_policy_log_probs[:, (segment_action_start_idx - 1):(segment_action_end_idx - 1), :]  # Shape (B, action_len, V)
+        new_action_log_probs_per_token = torch.gather(log_probs_dist_new, -1, action_tokens.unsqueeze(-1)).squeeze(-1)  # Shape (B, action_len)
+
+        # Check for NaN/Inf
+        if torch.isnan(new_action_log_probs_per_token).any() or torch.isinf(new_action_log_probs_per_token).any():
+            printc("NaN/Inf detected in policy log probs", "red")
+            return (
+                torch.tensor(0.0, device=device, requires_grad=True),
+                torch.tensor(0.0, device=device, requires_grad=True),
+                torch.tensor(0.0, device=device)
+            )
+
         new_action_log_probs_sum = new_action_log_probs_per_token.sum()
 
-        # 4. Extract new value V(S_prev)
-        # S_prev is the state just before the action starts. Its hidden state is at relative_action_start_idx - 1.
-        if relative_action_start_idx > 0:
-            s_prev_hidden_state = all_hidden_states_segment[:, relative_action_start_idx - 1, :]
-        else: # Action starts at the very beginning of input_ids_for_segment_forward
-              # This means S_prev is effectively the state *before* segment_prompt_and_thought_start_idx
-              # This case requires careful handling of what V(S_prev) means.
-              # For simplicity, if S_prev is empty, value_head might take BOS or learn V(empty).
-              # Here, assume if relative_action_start_idx is 0, we might need a different V_S_prev logic (e.g. from a BOS token hs)
-              # Let's assume S_prev always has some content for CoT steps, so relative_action_start_idx > 0.
-            printc("Warning: relative_action_start_idx is 0. V(S_prev) might be inaccurate.", "yellow")
-            # Fallback: use the first hidden state if available, or zero. Could lead to issues.
-            s_prev_hidden_state = all_hidden_states_segment[:, 0, :]
+        # 3. Extract value V(S_prev)
+        if segment_action_start_idx > 0:
+            s_prev_hidden_state = full_hidden_states[:, segment_action_start_idx - 1, :]
+        else:
+            printc("Warning: segment_action_start_idx is 0. Using first hidden state for V(S_prev).", "yellow")
+            s_prev_hidden_state = full_hidden_states[:, 0, :]
 
-
-        # Ensure value_head input is of the correct dtype (often float32)
         s_prev_hidden_state_for_value = s_prev_hidden_state.to(policy_model_current.value_head.weight.dtype)
-        new_V_S_prev_recomputed = policy_model_current.value_head(s_prev_hidden_state_for_value).squeeze(-1) # (1,)
+        new_V_S_prev_recomputed = policy_model_current.value_head(s_prev_hidden_state_for_value).squeeze(-1)  # Shape (B,)
 
-        # 5. Calculate KL divergence for the current action_tokens
-        kl_for_action_sum = torch.tensor(0.0, device=device)
-        if ref_model_current is not None and self.rft_config.beta > 0: # beta is kl_coef
-            with torch.no_grad(): # No grads for ref model
-                ref_outputs = ref_model_current(
-                    input_ids=input_ids_for_segment_forward, # Same input as policy
-                    attention_mask=attention_mask_for_segment_forward,
-                )
-                ref_all_logits_segment = ref_outputs.logits
-                ref_logits_for_action = ref_all_logits_segment[:, (relative_action_start_idx -1) : (relative_action_start_idx + action_tokens.size(1) -1) , :]
-                
-                ref_log_probs_dist = F.log_softmax(ref_logits_for_action, dim=-1)
-                ref_action_log_probs_per_token = torch.gather(ref_log_probs_dist, -1, action_tokens.unsqueeze(-1)).squeeze(-1)
-                
-                # KL per token: policy_log_p(token) - ref_log_p(token)
-                # Use new_action_log_probs_per_token (which has grad) and ref_action_log_probs_per_token.detach()
-                kl_div_per_token = new_action_log_probs_per_token - ref_action_log_probs_per_token.detach()
-                kl_for_action_sum = kl_div_per_token.sum()
-                # Clamp KL to avoid large values
-                kl_for_action_sum = torch.clamp(kl_for_action_sum, min=-30, max=30)
+        # 4. Calculate KL divergence (using precomputed full_kl_div in train)
+        kl_for_action_sum = torch.tensor(0.0, device=device)  # Placeholder, computed in train
 
         return new_action_log_probs_sum, new_V_S_prev_recomputed, kl_for_action_sum
-    
-    
-    
-    
+
+
+
     def train(self, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None, **kwargs):
         self._validate_initial_setup()
         main_model_vocab_size = self._get_model_config_vocab_size(self.model)
@@ -1133,21 +1150,20 @@ class RFTTrainer(Trainer):
         
         # Ensure model is in training mode for policy and value head updates
         self.model.train()
-        if self.ref_model: # Ref model should always be in eval mode
+        if self.ref_model:  # Ref model should always be in eval mode
             self.ref_model.eval()
 
         train_dataloader = self.get_train_dataloader()
-        if train_dataloader is None: raise ValueError("No train dataloader found.")
+        if train_dataloader is None:
+            raise ValueError("No train dataloader found.")
 
         len_dataloader, _, num_train_epochs, max_steps = \
             self._calculate_dataloader_dependent_steps(train_dataloader)
         
         self._initialize_trainer_internals(resume_from_checkpoint, max_steps)
-        # self.init_callbacks() # Called by _initialize_trainer_internals or parent
 
-        # For tracking accumulation across items if necessary
+        # For tracking accumulation across items
         self.state.num_backward_passes_accumulated = 0
-        # For display purposes: items processed in current accumulation cycle
         items_processed_in_accumulation_cycle = 0
 
         self.callback_handler.on_train_begin(self.args, self.state, self.control)
@@ -1156,45 +1172,43 @@ class RFTTrainer(Trainer):
             printc(f"Starting Epoch {epoch+1}/{num_train_epochs}", "yellow")
             self.control = self.callback_handler.on_epoch_begin(self.args, self.state, self.control)
             
-            if hasattr(train_dataloader, "set_epoch"): # For DistributedSampler
+            if hasattr(train_dataloader, "set_epoch"):
                 train_dataloader.set_epoch(epoch)
 
             batch_iterator = iter(train_dataloader)
             
-            while True: # Loop over batches/items
-                if self.state.global_step >= max_steps and max_steps > 0 :
+            while True:
+                if self.state.global_step >= max_steps and max_steps > 0:
                     printc(f"Reached max_steps ({max_steps}). Stopping training.", "yellow")
                     self.control.should_training_stop = True
                     break 
                 try:
-                    # Assuming batch is a list containing one item dictionary
                     batch_list = next(batch_iterator)
                     if not isinstance(batch_list, list) or not batch_list:
                         printc("Warning: Batch is not a list or is empty, skipping.", "yellow")
                         continue
-                    batch_item = batch_list[0] 
+                    batch_item = batch_list[0]
                 except StopIteration:
                     printc(f"End of dataloader reached for epoch {epoch+1}.", "blue")
                     break 
 
-                self.control = self.callback_handler.on_step_begin(self.args, self.state, self.control) # "Step" here is per item/micro-batch
+                self.control = self.callback_handler.on_step_begin(self.args, self.state, self.control)
                 
-                # Soft reset per item for idxs
-                self.soft_reset() 
+                # Soft reset per item
+                self.soft_reset()
 
                 # --- 1. Prepare Prompt ---
                 prompt_tokens, prompt_length, question_text, solution_text = self._prepare_item_prompt(
                     batch_item, main_model_vocab_size, f"E{epoch+1}_S{self.state.global_step}"
                 )
-                if prompt_tokens is None: 
+                if prompt_tokens is None:
                     continue
 
                 # --- 2. Generate Full CoT Sequence (Policy Model "Old" Outputs) ---
-                # This provides old_log_probs and old_hidden_states for PPO
                 prompt_completion_ids, full_policy_log_probs_initial, full_policy_hidden_states_initial = \
                     self._generate_sequence_and_get_model_outputs(
                         self.model, prompt_tokens, f"E{epoch+1}_S{self.state.global_step}_PolicyRollout",
-                        is_trainable_policy_model=False, # Treat as fixed for this rollout; grad comes from re-eval
+                        is_trainable_policy_model=False,
                         get_hidden_states_flag=True
                     )
                 if prompt_completion_ids is None or full_policy_log_probs_initial is None or full_policy_hidden_states_initial is None:
@@ -1204,70 +1218,93 @@ class RFTTrainer(Trainer):
                 # --- 3. Get Reference Log Probabilities ---
                 _, full_ref_log_probs, _ = self._generate_sequence_and_get_model_outputs(
                     self.ref_model, prompt_tokens, f"E{epoch+1}_S{self.state.global_step}_RefRollout",
-                    is_trainable_policy_model=False, get_hidden_states_flag=False,
-                    # Provide generated_ids_override=prompt_completion_ids to ensure ref model scores the same sequence
-                    # This needs to be added to _generate_sequence_and_get_model_outputs if not present
-                    # For now, assuming it generates and then we align. More robust is override.
+                    is_trainable_policy_model=False,
+                    get_hidden_states_flag=False
                 )
-                # If using override, ensure generated_ids_override is handled in _generate_sequence_and_get_model_outputs
-                # For now, let's assume it's handled by aligning based on prompt_tokens and prompt_completion_ids
+                if full_ref_log_probs is None:
+                    printc(f"Skipping item E{epoch+1}_S{self.state.global_step}: Reference log probs failed.", "yellow")
+                    continue
 
-                # --- 4. Decode and Segment the CoT ---
-                # `self.idxs` will be populated here.
-                # Example: [0, prompt_len, prompt_len+len(T1), ..., end_of_last_thought, full_completion_len]
-                steps_text_raw,  answer_text_decoded, self.idxs = self.decode_and_split_completion(
-                        prompt_completion_ids, prompt_length, main_model_vocab_size,
-                        prompt_tokens, f"E{epoch+1}_S{self.state.global_step}"
-                    )
-                if steps_text_raw is None or not self.idxs or len(self.idxs) < 2: # Need at least prompt_len and one step end
+                # --- 4. Compute Full-Sequence KL Divergence ---
+                full_kl_div = self.get_full_kl_divergence(
+                    full_policy_log_probs_initial[:, :-1, :],  # Slice to (B, L-1, V)
+                    full_ref_log_probs[:, :-1, :],             # Slice to (B, L-1, V)
+                    prompt_completion_ids
+                )
+                if full_kl_div is None:
+                    printc(f"Skipping item E{epoch+1}_S{self.state.global_step}: KL divergence calculation failed.", "yellow")
+                    continue
+
+                # --- 5. Decode and Segment the CoT ---
+                steps_text_raw, answer_text_decoded, self.idxs = self.decode_and_split_completion(
+                    prompt_completion_ids, prompt_length, main_model_vocab_size,
+                    prompt_tokens, f"E{epoch+1}_S{self.state.global_step}"
+                )
+                if steps_text_raw is None or not self.idxs or len(self.idxs) < 2:
                     printc(f"Skipping item E{epoch+1}_S{self.state.global_step}: CoT splitting failed.", "yellow")
                     continue
                 
-                # --- 5. Get Value Estimates V_old(S_boundary) from initial rollout ---
-                # values_at_boundaries[k] = V_old(State up to self.idxs[k+1])
+                # --- 6. Get Value Estimates V_old(S_boundary) ---
                 values_at_boundaries_old = self.cumulative_slices(
                     full_policy_hidden_states_initial[-1], self.idxs, self.model
                 )
-                if not values_at_boundaries_old or len(values_at_boundaries_old) != (len(self.idxs) -1):
-                    printc(f"Skipping item E{epoch+1}_S{self.state.global_step}: Value estimation mismatch. Got {len(values_at_boundaries_old)} values for {len(self.idxs)-1} boundaries.", "red")
+                if not values_at_boundaries_old or len(values_at_boundaries_old) != (len(self.idxs) - 1):
+                    printc(f"Skipping item E{epoch+1}_S{self.state.global_step}: Value estimation mismatch.", "red")
                     continue
                 
-                # --- 6. Evaluate Rewards for each generated thought step ---
-                # rewards_for_thoughts should align with steps_text_raw
+                # --- 7. Evaluate Rewards ---
                 rewards_data_full = self._evaluate_and_process_item_rewards(
                     question_text, steps_text_raw, answer_text_decoded, solution_text,
                     f"E{epoch+1}_S{self.state.global_step}"
                 )
                 print_thoughts_colored(rewards_data_full)
-                if rewards_data_full is None: 
+                if rewards_data_full is None:
                     printc(f"Skipping item E{epoch+1}_S{self.state.global_step}: Reward evaluation failed.", "yellow")
                     continue
                 
-                # Extract just the reward values for PPO loop
                 rewards_for_thoughts = []
                 for step_reward_data in rewards_data_full:
                     reward_key = 'whitened_score' if self.rft_config.whiten_rewards and 'whitened_score' in step_reward_data else 'combined_score'
-                    if reward_key in step_reward_data:
-                        rewards_for_thoughts.append(step_reward_data[reward_key])
-                    else:
-                        rewards_for_thoughts.append(0.0) # Default if missing
+                    rewards_for_thoughts.append(step_reward_data.get(reward_key, 0.0))
 
-                num_thought_segments = len(rewards_for_thoughts) # This includes the final answer step
+                num_thought_segments = len(rewards_for_thoughts)
                 if num_thought_segments == 0:
                     printc(f"Skipping item E{epoch+1}_S{self.state.global_step}: No reward segments.", "yellow")
                     continue
-                if num_thought_segments > len(values_at_boundaries_old): # values_at_boundaries_old has V(Prompt), V(P+T1), ... V(P+...+TN)
-                     printc(f"Warning: Mismatch num_rewards ({num_thought_segments}) and num_values ({len(values_at_boundaries_old)}). Trimming rewards.", "yellow")
-                     rewards_for_thoughts = rewards_for_thoughts[:len(values_at_boundaries_old)]
-                     num_thought_segments = len(rewards_for_thoughts)
+                if num_thought_segments > len(values_at_boundaries_old):
+                    printc(f"Warning: Mismatch num_rewards ({num_thought_segments}) and num_values ({len(values_at_boundaries_old)}). Trimming rewards.", "yellow")
+                    rewards_for_thoughts = rewards_for_thoughts[:len(values_at_boundaries_old)]
+                    num_thought_segments = len(rewards_for_thoughts)
 
-                # --- 7. Iterate through each THOUGHT STEP of the CoT and perform PPO update ---
-                current_item_total_loss = 0.0
+                # --- 8. Precompute Policy Log Probs and Hidden States for Training ---
+                with torch.enable_grad():
+                    outputs = self.model(
+                        input_ids=prompt_completion_ids,
+                        attention_mask=torch.ones_like(prompt_completion_ids, device=device),
+                        output_hidden_states=True
+                    )
+                    logits = outputs.logits
+     
+                    min_val = torch.finfo(logits.dtype).min
+                    max_val = torch.finfo(logits.dtype).max
+                    logits = torch.clamp(logits, min=min_val, max=max_val)
+
+                    logits = logits / (self.rft_config.temperature + 1e-7)
+                    full_policy_log_probs_train = F.log_softmax(logits, dim=-1)
+                    full_hidden_states_train = outputs.hidden_states[-1]
+
+                if torch.isnan(full_policy_log_probs_train).any() or torch.isinf(full_policy_log_probs_train).any():
+                    printc(f"NaN/Inf in training log_probs for E{epoch+1}_S{self.state.global_step}", "red")
+                    continue
+
+                # Compute cumulative KL sums for efficiency
+                kl_cumsum = torch.cumsum(full_kl_div, dim=1)  # Shape (B, L-1)
+
+                # --- 9. Iterate through each THOUGHT STEP ---
+                thought_losses = []
+                current_item_kl_sum = 0.0
                 for k_thought in range(num_thought_segments):
-                    # Define segment boundaries using self.idxs
-                    # S_prev state ends at self.idxs[k_thought + 1] (e.g. self.idxs[1]=prompt_len for 0th thought)
-                    # Action (current thought) is from self.idxs[k_thought + 1] to self.idxs[k_thought + 2]
-                    segment_prompt_and_thought_start_idx = self.idxs[0] # Usually 0, start of the original prompt
+                    segment_prompt_and_thought_start_idx = self.idxs[0]
                     segment_action_start_idx = self.idxs[k_thought + 1]
                     segment_action_end_idx = self.idxs[k_thought + 2]
 
@@ -1275,59 +1312,54 @@ class RFTTrainer(Trainer):
                         printc(f"Warning: Empty thought segment for k_thought={k_thought}. Skipping.", "grey")
                         continue
 
-                    # a. Get pre-calculated "old" data for this step
+                    # a. Get pre-calculated data
                     R_curr_thought = torch.tensor(rewards_for_thoughts[k_thought], device=device)
-                    V_S_prev_old = values_at_boundaries_old[k_thought].detach() # V_old(State before action)
+                    V_S_prev_old = values_at_boundaries_old[k_thought].detach()
 
                     is_last_thought_in_cot = (k_thought == num_thought_segments - 1)
-
-                    if is_last_thought_in_cot:
-                        if self.rft_config.treat_last_step_terminal:
-                            V_S_curr_old_for_td = torch.tensor(0.0, device=device)
-                        elif (k_thought + 1) < len(values_at_boundaries_old):
-                            V_S_curr_old_for_td = values_at_boundaries_old[k_thought + 1].detach()
-                        else:
-                            V_S_curr_old_for_td = torch.tensor(0.0, device=device)
-                    else:
-                        if (k_thought + 1) >= len(values_at_boundaries_old):
-                            printc(f"Error: Index out of bounds for V_S_curr_old at k_thought={k_thought}", "red")
-                            continue
+                    if is_last_thought_in_cot and self.rft_config.treat_last_step_terminal:
+                        V_S_curr_old_for_td = torch.tensor(0.0, device=device)
+                    elif (k_thought + 1) < len(values_at_boundaries_old):
                         V_S_curr_old_for_td = values_at_boundaries_old[k_thought + 1].detach()
+                    else:
+                        V_S_curr_old_for_td = torch.tensor(0.0, device=device)
 
-                                        
-                    # b. Calculate "old" policy log_probs for the action
+                    # b. Calculate old policy log probs
                     action_tokens_ids = prompt_completion_ids[:, segment_action_start_idx:segment_action_end_idx]
-                    if action_tokens_ids.size(1) == 0: 
+                    if action_tokens_ids.size(1) == 0:
                         continue
 
-                    # Slice from full_policy_log_probs_initial (B, L-1, V)
-                    # Logits for token i are at log_probs[:, i-1, :]
-                    # Action tokens are from index segment_action_start_idx to segment_action_end_idx-1
-                    # So, log_probs are from index segment_action_start_idx-1 to segment_action_end_idx-2
                     old_log_probs_dist_for_action = full_policy_log_probs_initial[:, (segment_action_start_idx-1):(segment_action_end_idx-1), :]
                     gathered_old_log_probs = torch.gather(old_log_probs_dist_for_action, -1, action_tokens_ids.unsqueeze(-1)).squeeze(-1)
                     old_action_log_probs_sum = gathered_old_log_probs.sum().detach()
 
-                    # c. Get "new" log_probs, "new" V(S_prev) and KL for the segment from current model
-                    new_action_log_probs_sum, new_V_S_prev_recomputed, kl_for_action_sum = self._get_new_logprobs_value_and_kl_for_thought_segment(
-                            self.model, self.ref_model, prompt_completion_ids,
-                            segment_prompt_and_thought_start_idx,
-                            segment_action_start_idx, segment_action_end_idx
-                        )
-                    
-                    # d. Calculate Advantage
-                    td_target_for_V_S_prev = R_curr_thought + self.rft_config.gamma * V_S_curr_old_for_td # TD target uses V_old from rollout
-                    advantage_for_curr_thought = (td_target_for_V_S_prev - new_V_S_prev_recomputed).detach() # Advantage uses new V_S_prev prediction
+                    # c. Get new log probs and V(S_prev)
+                    new_action_log_probs_sum, new_V_S_prev_recomputed, _ = self._get_new_logprobs_value_and_kl_for_thought_segment(
+                        self.model, None, prompt_completion_ids,
+                        segment_prompt_and_thought_start_idx, segment_action_start_idx, segment_action_end_idx,
+                        full_policy_log_probs_train, full_hidden_states_train
+                    )
 
-                    # e. Policy Loss (PPO-like)
+                    # d. Compute segment KL using cumulative sums
+                    kl_start_idx = segment_action_start_idx - 1
+                    kl_end_idx = segment_action_end_idx - 1
+                    if kl_start_idx > 0:
+                        kl_for_action_sum = kl_cumsum[:, kl_end_idx - 1] - kl_cumsum[:, kl_start_idx - 1]
+                    else:
+                        kl_for_action_sum = kl_cumsum[:, kl_end_idx - 1]
+                    current_item_kl_sum += kl_for_action_sum.item()
+
+                    # e. Calculate Advantage
+                    td_target_for_V_S_prev = R_curr_thought + self.rft_config.gamma * V_S_curr_old_for_td
+                    advantage_for_curr_thought = (td_target_for_V_S_prev - new_V_S_prev_recomputed).detach()
+
+                    # f. Policy Loss
                     ratio = torch.exp(new_action_log_probs_sum - old_action_log_probs_sum)
                     pg_loss1 = -advantage_for_curr_thought * ratio
                     pg_loss2 = -advantage_for_curr_thought * torch.clamp(ratio, 1.0 - self.rft_config.clip_epsilon, 1.0 + self.rft_config.clip_epsilon)
                     step_policy_loss = torch.max(pg_loss1, pg_loss2)
 
-                    # f. Value Loss for V_S_prev (PPO-like)
-                    # `new_V_S_prev_recomputed` is the prediction. `td_target_for_V_S_prev` is the target.
-                    # `V_S_prev_old` is for clipping.
+                    # g. Value Loss
                     vf_loss1_step = torch.square(new_V_S_prev_recomputed - td_target_for_V_S_prev.detach())
                     if self.rft_config.cliprange_value > 0:
                         V_S_prev_clipped = V_S_prev_old + torch.clamp(
@@ -1340,68 +1372,70 @@ class RFTTrainer(Trainer):
                     else:
                         step_value_loss = 0.5 * vf_loss1_step
                     
-                    # g. Total Loss for this thought step
-                    step_kl_penalty_loss = self.rft_config.beta * kl_for_action_sum # beta is kl_coef
-                    total_loss_for_thought_step = step_policy_loss + \
-                                                  self.rft_config.vf_coef * step_value_loss + \
-                                                  step_kl_penalty_loss
+                    # h. Total Loss for this thought step
+                    step_kl_penalty_loss = self.rft_config.beta * kl_for_action_sum
+                    total_loss_for_thought_step = step_policy_loss + self.rft_config.vf_coef * step_value_loss + step_kl_penalty_loss
+                    thought_losses.append(total_loss_for_thought_step)
+
+                if not thought_losses:
+                    printc(f"Skipping item E{epoch+1}_S{self.state.global_step}: No valid thought segments.", "yellow")
+                    continue
+
+                # Compute total loss for the item
+                total_loss = sum(thought_losses)
+
+                # Perform a single backward pass
+                actual_loss_to_backward = total_loss / self.rft_config.gradient_accumulation_steps
+                self.accelerator.backward(actual_loss_to_backward)
+                self.state.num_backward_passes_accumulated += 1
+
+                # Optimizer step after accumulation
+                if self.state.num_backward_passes_accumulated % self.rft_config.gradient_accumulation_steps == 0:
+                    if self.rft_config.max_grad_norm is not None and self.rft_config.max_grad_norm > 0:
+                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.rft_config.max_grad_norm)
                     
-                    current_item_total_loss += total_loss_for_thought_step.item() # For logging
+                    self.optimizer.step()
+                    if not self.accelerator.optimizer_step_was_skipped:
+                        if self.lr_scheduler is not None:
+                            self.lr_scheduler.step()
+                    
+                    self.optimizer.zero_grad()
+                    self.state.global_step += 1
+                    items_processed_in_accumulation_cycle = 0
 
-                    # h. Backward Pass for THIS THOUGHT STEP (accumulated)
-                    # Scale by 1/gradient_accumulation_steps for manual accumulation
-                    actual_loss_to_backward = total_loss_for_thought_step / self.rft_config.gradient_accumulation_steps
-                    self.accelerator.backward(actual_loss_to_backward)
-                    self.state.num_backward_passes_accumulated += 1
+                    # Log metrics
+                    log_metrics = {
+                        "loss": total_loss.item(),
+                        "policy_loss_step": step_policy_loss.item(),
+                        "value_loss_step": step_value_loss.item(),
+                        "kl_loss_step": step_kl_penalty_loss.item(),
+                        "kl_avg": current_item_kl_sum / num_thought_segments if num_thought_segments > 0 else 0,
+                        "learning_rate": self.lr_scheduler.get_last_lr()[0] if self.lr_scheduler else self.optimizer.param_groups[0]['lr'],
+                        "epoch": epoch + ((self.state.global_step * self.rft_config.gradient_accumulation_steps) / len_dataloader if len_dataloader else 0)
+                    }
+                    self.log(log_metrics)
 
-                    # i. Optimizer Step if accumulation count is met
-                    if self.state.num_backward_passes_accumulated % self.rft_config.gradient_accumulation_steps == 0:
-                        if self.rft_config.max_grad_norm is not None and self.rft_config.max_grad_norm > 0:
-                            self.accelerator.clip_grad_norm_(self.model.parameters(), self.rft_config.max_grad_norm)
-                        
-                        self.optimizer.step()
-                        # Check if LR scheduler needs to be stepped
-                        if not self.accelerator.optimizer_step_was_skipped: # Only step if optimizer actually stepped
-                            if self.lr_scheduler is not None:
-                                self.lr_scheduler.step()
-                        
-                        self.optimizer.zero_grad()
-                        self.state.global_step += 1
-                        items_processed_in_accumulation_cycle = 0 # Reset for display counter
-                        
-                        # Log metrics per optimizer step
-                        log_metrics = {
-                            "loss": current_item_total_loss / (k_thought + 1) if (k_thought + 1) > 0 else 0, # Avg loss over thoughts in this item leading to optim step
-                            "policy_loss_step": step_policy_loss.item(), # From last thought
-                            "value_loss_step": step_value_loss.item(),   # From last thought
-                            "kl_loss_step": step_kl_penalty_loss.item(), # From last thought
-                            "learning_rate": self.lr_scheduler.get_last_lr()[0] if self.lr_scheduler else self.optimizer.param_groups[0]['lr'],
-                            "epoch": epoch + ( (self.state.global_step * self.rft_config.gradient_accumulation_steps) / len_dataloader if len_dataloader else 0)
-                        }
-                        self.log(log_metrics)
+                    self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+                    self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics=None)
+                    if self.control.should_save:
+                        self._save_checkpoint(self.model, trial)
+                    if self.control.should_evaluate:
+                        self.evaluate()
 
-                        # Check for saving/evaluation based on global_step
-                        self.control = self.callback_handler.on_save(self.args, self.state, self.control)
-                        self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics=None)
-                        if self.control.should_save: 
-                            self._save_checkpoint(self.model, trial) # Or appropriate save logic
-                        if self.control.should_evaluate: 
-                            self.evaluate() # Or appropriate eval logic
-
-                # End of thoughts for an item
-                items_processed_in_accumulation_cycle +=1
-                # Callbacks after processing an entire item
+                items_processed_in_accumulation_cycle += 1
                 self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics=None)
 
-                if self.control.should_training_stop: 
-                    break # Break from item loop
+                if self.control.should_training_stop:
+                    break
 
-            # End of batch_iterator (epoch)
             self.control = self.callback_handler.on_epoch_end(self.args, self.state, self.control)
-            if self.control.should_training_stop: 
-                break # Break from epoch loop
+            if self.control.should_training_stop:
+                break
         
-        # End of training
         self.callback_handler.on_train_end(self.args, self.state, self.control)
         if self.control.should_save:
-            self._save_checkpoint(self.model, trial) # Final save
+            self._save_checkpoint(self.model, trial)
+
+
+         
+#EOS
