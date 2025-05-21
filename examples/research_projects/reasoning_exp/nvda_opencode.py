@@ -97,8 +97,8 @@ config.question = 'input'
 config.answer = 'solution'
 config.system_prompt = 'Solve the coding question:\n'
 config.debug_log = True
-config.response_length=500
-config.max_completion_length=10
+config.response_length=1000
+config.max_completion_length=1000
 
 # --- Load Dataset ---
 dataset = load_dataset("nvidia/OpenCodeReasoning", 'split_0')['split_0']

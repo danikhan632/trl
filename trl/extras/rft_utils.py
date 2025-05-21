@@ -209,22 +209,6 @@ def average_normalized_score(thoughts):
         return 0.0
     return sum(scores) / len(scores)
 
-def print_thoughts_colored(thoughts):
-    def score_to_rgb(norm_score):
-        clamped = max(min(norm_score, 1.5), -1.5)
-        if clamped >= 0:
-            intensity = int(255 * (clamped / 1.5))
-            return (0, intensity, 0)
-        else:
-            intensity = int(255 * (-clamped / 1.5))
-            return (intensity, 0, 0)
-
-    for thought in thoughts:
-        txt = thought['txt']
-        # fall back to combined_score if whitened_score isn't present
-        norm_score = thought.get('whitened_score', thought.get('combined_score', 0))
-        r, g, b = score_to_rgb(norm_score)
-        print(f"\033[38;2;{r};{g};{b}m{txt}\033[0m\n")
 
 
 
@@ -297,9 +281,6 @@ def process_rewards(overall,steps, config):
         
     return combined_scores
 
-
-
-
 def split_cot(text, delim, threshold_factor=1.0):
     import re
 
@@ -343,6 +324,8 @@ def split_cot(text, delim, threshold_factor=1.0):
             i += 1
 
     return fused_entries
+
+
 
 
 

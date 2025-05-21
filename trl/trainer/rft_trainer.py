@@ -50,8 +50,8 @@ from accelerate import Accelerator
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
 
-if is_vllm_available():
-    from vllm import LLM, SamplingParams
+# if is_vllm_available():
+#     from vllm import LLM, SamplingParams
 
 if is_wandb_available():
     import wandb
@@ -376,9 +376,6 @@ class RFTTrainer(Trainer):
 
 
 
-
-
-
     def _generate_sequence_and_get_model_outputs(
         self,
         model_obj,
@@ -388,20 +385,21 @@ class RFTTrainer(Trainer):
         get_hidden_states_flag=True
     ):
         """
-        Generates a sequence using model_obj (with optional forced-answer logic),
-        then computes its log_probs and hidden_states via a forward pass.
+        Generates a sequence using model_obj with the given prompt_tokens,
+        then computes its log probabilities and hidden states via a forward pass.
+        Handles errors gracefully by returning None for invalid cases.
         """
+        # Get device and vocabulary sizes
         device = self.accelerator.device
         model_vocab_size = self._get_model_config_vocab_size(model_obj)
         processing_class_vocab_size = self._get_processing_class_vocab_size()
 
-        # Ensure processing_class has a valid pad token
+        # Ensure pad token is valid
         if self.processing_class.pad_token_id is None or self.processing_class.pad_token_id < 0:
             eos_tok = self.processing_class.eos_token or self.processing_class.eos_token_id
             self.processing_class.add_special_tokens({'pad_token': eos_tok})
             model_obj.resize_token_embeddings(self._get_processing_class_vocab_size())
 
-        # Determine pad ID
         pad_id = self.generation_config.pad_token_id or self.processing_class.pad_token_id
         if pad_id < 0 or pad_id > processing_class_vocab_size:
             safe_id = self.processing_class.eos_token_id
@@ -413,56 +411,23 @@ class RFTTrainer(Trainer):
                 )
             pad_id = safe_id
 
-        # Copy config and set pad_token_id
+        # Configure generation settings
         gen_cfg = self.generation_config
         gen_cfg.pad_token_id = pad_id
 
-        # Token generation
+        # Generate sequence without gradients
         try:
-            special_token_id = 151668
-            pad_token_id = self.processing_class.pad_token_id
             unwrapped = self.accelerator.unwrap_model(model_obj)
             unwrapped_device = unwrapped.device
-
             with torch.no_grad():
-                # Move inputs
                 inputs = {k: v.to(unwrapped_device) for k, v in prompt_tokens.items()}
-
-                if not self.rft_config.force_answer:
-                    # Standard generation
-                    generated = unwrapped.generate(
-                        **inputs,
-                        generation_config=gen_cfg
-                    )
-                else:
-                    # Force-answer: generate until special_token_id appears
-                    batch_seqs = []
-                    for i in range(inputs['input_ids'].size(0)):
-                        seq = unwrapped.generate(
-                            **{k: v[i:i+1] for k, v in inputs.items()},
-                            generation_config=gen_cfg
-                        )[0]
-                        # Append special token until seen
-                        while special_token_id not in seq:
-                            seq = torch.cat([seq, torch.tensor([special_token_id], device=unwrapped_device)])
-                            seq = unwrapped.generate(
-                                input_ids=seq.unsqueeze(0),
-                                generation_config=gen_cfg
-                            )[0]
-                        batch_seqs.append(seq)
-                    # Pad sequences
-                    max_len = max(s.size(0) for s in batch_seqs)
-                    generated = torch.stack([
-                        F.pad(s, (0, max_len - s.size(0)), value=pad_token_id)
-                        for s in batch_seqs
-                    ], dim=0)
-
-            prompt_completion_ids = generated.to(device)
+                generated = unwrapped.generate(**inputs, generation_config=gen_cfg)
+                prompt_completion_ids = generated.to(device)
         except Exception as e:
             printc(f"Error in generation for {train_step_display}: {e}", "red")
             return None, None, None
 
-        # Validate generation output
+        # Validate the generated sequence
         if prompt_completion_ids.numel() == 0:
             printc(f"Empty prompt_completion_ids for {train_step_display}", "yellow")
             return None, None, None
@@ -474,32 +439,31 @@ class RFTTrainer(Trainer):
             printc(f"No new tokens generated for {train_step_display}", "yellow")
             return None, None, None
 
-
+        # Prepare attention mask
         attention_mask = torch.ones_like(prompt_completion_ids, device=device)
 
-        # Forward pass for log probs and hidden states
+        # Compute log probabilities and hidden states without gradients
         try:
             if not is_trainable_policy_model and hasattr(model_obj, 'eval'):
                 model_obj.eval()
-            # Perform forward pass in FP32 to avoid FP16 overflow
-            with torch.autocast(device_type='cuda', dtype=torch.float32, enabled=False):
-                outputs = model_obj(
-                    input_ids=prompt_completion_ids,
-                    attention_mask=attention_mask,
-                    output_hidden_states=get_hidden_states_flag
-                )
-                # Ensure logits are in FP32 and clip them to a safe range
-                logits = outputs.logits.float()  # Convert to FP32
-                logits = torch.clamp(logits, min=-1e4, max=1e4)  # Prevent extreme values
-                # Apply temperature scaling safely
-                logits = logits / (self.rft_config.temperature + 1e-7)  # Add small epsilon to avoid division by zero
-                log_probs = F.log_softmax(logits, dim=-1)  # Compute log probabilities
-                hidden_states = outputs.hidden_states if get_hidden_states_flag and hasattr(outputs, 'hidden_states') else None
+            with torch.no_grad():
+                with torch.autocast(device_type='cuda', dtype=torch.float32, enabled=False):
+                    outputs = model_obj(
+                        input_ids=prompt_completion_ids,
+                        attention_mask=attention_mask,
+                        output_hidden_states=get_hidden_states_flag
+                    )
+                    logits = outputs.logits.float()  # Ensure FP32 precision
+                    logits = torch.clamp(logits, min=-1e4, max=1e4)  # Prevent extreme values
+                    temperature = self.rft_config.temperature + 1e-7  # Avoid division by zero
+                    logits = logits / temperature
+                    log_probs = F.log_softmax(logits, dim=-1)
+                    hidden_states = outputs.hidden_states if get_hidden_states_flag else None
 
-                # Check for numerical issues
-                if torch.isnan(log_probs).any() or torch.isinf(log_probs).any():
-                    print(f"NaN/Inf in log probs for {train_step_display}")
-                    return None, None, None
+                    # Check for numerical stability
+                    if torch.isnan(log_probs).any() or torch.isinf(log_probs).any():
+                        print(f"NaN/Inf detected in log probs for {train_step_display}")
+                        return None, None, None
         except Exception as e:
             print(f"Error in forward pass for {train_step_display}: {e}")
             return None, None, None
@@ -681,16 +645,20 @@ class RFTTrainer(Trainer):
         """Decodes completion, splits CoT, and extracts steps."""
         completion_ids = prompt_completion_ids[:, prompt_length:]
         if completion_ids.shape[1] == 0:
-            printc(f"Skipping item {train_step_display}: No completion tokens generated.", "yellow"); return None, None, None
+            printc(f"Skipping item {train_step_display}: No completion tokens generated.", "yellow")
+            return None, None, None
         
         min_comp_id, max_comp_id = completion_ids.min().item(), completion_ids.max().item()
         if min_comp_id < 0 or max_comp_id >= model_vocab_size:
-            printc(f"ERROR: Invalid completion token IDs (min={min_comp_id}, max={max_comp_id}) for item {train_step_display}.", "red"); return None, None, None
+            printc(f"ERROR: Invalid completion token IDs (min={min_comp_id}, max={max_comp_id}) for item {train_step_display}.", "red")
+            return None, None, None
 
         try:
             full_text = self.processing_class.decode(completion_ids[0], skip_special_tokens=True, clean_up_tokenization_spaces=True)
+            print(full_text)
         except Exception as decode_e:
-            printc(f"Error decoding completion for item {train_step_display}: {decode_e}", "red"); return None, None, None
+            printc(f"Error decoding completion for item {train_step_display}: {decode_e}", "red")
+            return None, None, None
         
         # Original logic for removing b_think and e_think prefix
         # Assuming self.rft_config.b_think was already added to prompt, and e_think is expected at start of generation
@@ -718,11 +686,13 @@ class RFTTrainer(Trainer):
             cot, answer = full_text.strip(), self.rft_config.answer_default
 
         if not cot:
-            printc(f"Skipping item {train_step_display}: Empty Chain-of-Thought after splitting.", "yellow"); return None, None, None
+            printc(f"Skipping item {train_step_display}: Empty Chain-of-Thought after splitting.", "yellow")
+            return None, None, None
 
         steps_text_raw = split_cot(cot, self.rft_config.delimiter) # self.rft_config.delimiter for steps
         if not steps_text_raw:
-            printc(f"Skipping item {train_step_display}: No steps found after splitting CoT.", "yellow"); return None, None, None
+            printc(f"Skipping item {train_step_display}: No steps found after splitting CoT.", "yellow")
+            return None, None, None
             
         return cot, answer, steps_text_raw 
     
@@ -1141,17 +1111,17 @@ class RFTTrainer(Trainer):
 
         return new_action_log_probs_sum, new_V_S_prev_recomputed, kl_for_action_sum
 
-
-
     def train(self, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None, **kwargs):
         self._validate_initial_setup()
         main_model_vocab_size = self._get_model_config_vocab_size(self.model)
         device = self.accelerator.device
         
-        # Ensure model is in training mode for policy and value head updates
+        # Ensure model is in training mode
         self.model.train()
-        if self.ref_model:  # Ref model should always be in eval mode
-            self.ref_model.eval()
+        if self.ref_model is not None:
+
+            self.ref_model.to(device).eval()  # Reference model stays in eval mode
+            print("Reference model initialized as a copy of policy model.")
 
         train_dataloader = self.get_train_dataloader()
         if train_dataloader is None:
@@ -1287,9 +1257,8 @@ class RFTTrainer(Trainer):
      
                     min_val = torch.finfo(logits.dtype).min
                     max_val = torch.finfo(logits.dtype).max
-                    logits = torch.clamp(logits, min=min_val, max=max_val)
+                    logits = torch.clamp(logits, min=-1e4, max=1e4) / (self.rft_config.temperature + 1e-7)
 
-                    logits = logits / (self.rft_config.temperature + 1e-7)
                     full_policy_log_probs_train = F.log_softmax(logits, dim=-1)
                     full_hidden_states_train = outputs.hidden_states[-1]
 
@@ -1373,6 +1342,8 @@ class RFTTrainer(Trainer):
                         step_value_loss = 0.5 * vf_loss1_step
                     
                     # h. Total Loss for this thought step
+                    # kl_for_action_sum= torch.zeros_like(kl_for_action_sum)
+                    # current_item_kl_sum=0.0
                     step_kl_penalty_loss = self.rft_config.beta * kl_for_action_sum
                     total_loss_for_thought_step = step_policy_loss + self.rft_config.vf_coef * step_value_loss + step_kl_penalty_loss
                     thought_losses.append(total_loss_for_thought_step)
