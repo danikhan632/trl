@@ -64,6 +64,11 @@ class GRPOConfig(TrainingArguments):
 
         > Parameters that control generation
 
+        generation_batch_size: (`int` or `None`, *optional*, defaults to `None`):
+            Batch size to use for generation. If `None`, it defaults to the effective training batch size:
+            `per_device_train_batch_size * num_processes * gradient_accumulation_steps`.
+        steps_per_generations: (`int` or `None`, *optional*, defaults to `None`):
+            Number of optimization steps per generation. If `None`, it defaults to gradient_accumulation_steps.
         temperature (`float`, defaults to `0.9`):
             Temperature for sampling. The higher the temperature, the more random the completions.
         top_p (`float`, *optional*, defaults to `1.0`):
@@ -85,17 +90,39 @@ class GRPOConfig(TrainingArguments):
         > Parameters that control generation acceleration powered by vLLM
 
         use_vllm (`bool`, *optional*, defaults to `False`):
-            Whether to use vLLM for generating completions. If set to `True`, ensure that a GPU is kept unused for
-            training, as vLLM will require one for generation. vLLM must be installed (`pip install vllm`).
+            Whether to use vLLM for generating completions. If set to `True`, the trainer will use vLLM for generation
+            instead of the default model.generate(). Requires `vllm` to be installed.
+        vllm_mode (`str`, *optional*, defaults to `"server"`):
+            Mode to use for vLLM integration when `use_vllm` is set to `True`. Must be one of `"server"` or
+            `"colocate"`.
+
+            - `"server"`: The trainer will send generation requests to a separate vLLM server. Make sure a TRL vLLM
+              server is running (start with `trl vllm-serve`).
+            - `"colocate"`: vLLM will run in the same process and share the training GPUs. This avoids the need for a
+              separate server but may cause resource contention with training.
+        vllm_guided_decoding_regex (`str` or `None`, *optional*, defaults to `None`):
+            Regex for vLLM guided decoding. If `None` (default), guided decoding is disabled.
+
+        > Parameters that control the vLLM server (only used when `vllm_mode` is `"server"`)
+
         vllm_server_host (`str`, *optional*, defaults to `"0.0.0.0"`):
             Host of the vLLM server to connect to.
         vllm_server_port (`int`, *optional*, defaults to `8000`):
             Port of the vLLM server to connect to.
-        vllm_server_timeout (`float`, *optional*, defaults to `120.0`):
+        vllm_server_timeout (`float`, *optional*, defaults to `240.0`):
             Total timeout duration in seconds to wait for the vLLM server to be up. If the server is not up after the
             timeout, a `ConnectionError` is raised.
-        vllm_guided_decoding_regex (`str` or `None`, *optional*, defaults to `None`):
-            Regex for vLLM guided decoding. If `None` (default), guided decoding is disabled.
+
+        > Parameters that control colocated vLLM execution (only used when `vllm_mode` is `"colocate"`)
+
+        vllm_gpu_memory_utilization (`float`, *optional*, defaults to `0.3`):
+            Control the GPU memory utilization for vLLM. This setting only applies when `vllm_mode` is set to
+            `"colocate"`. If you are using `vllm_mode="server"`, this parameter must be passed separately when
+            launching the vLLM server via the `--vllm_gpu_memory_utilization` flag.
+        vllm_tensor_parallel_size (`int`, *optional*, defaults to `1`):
+            Control the tensor parallel size for vLLM. This setting only applies when `vllm_mode` is set to
+            `"colocate"`. If you are using `vllm_mode="server"`, this parameter must be passed separately when
+            launching the vLLM server via the `--vllm_tensor_parallel_size` flag.
 
         > Parameters that control the training
 
@@ -109,6 +136,8 @@ class GRPOConfig(TrainingArguments):
             Number of iterations per batch (denoted as μ in the algorithm).
         epsilon (`float`, *optional*, defaults to `0.2`):
             Epsilon value for clipping.
+        delta: (`float`, *optional*, defaults to `None`):
+            Delta value for the upper clipping bound in two-sided GRPO. Recommended to be > 1 + epsilon. This method was introduced in the [INTELLECT-2 tech report](https://huggingface.co/papers/2505.07291).
         epsilon_high (`float` or `None`, *optional*, defaults to `None`):
             Upper-bound epsilon value for clipping. If not specified, it defaults to the same value as the lower-bound
             specified in argument `epsilon`. Paper [DAPO](https://huggingface.co/papers/2503.14476) recommends `0.28`.
@@ -139,7 +168,7 @@ class GRPOConfig(TrainingArguments):
             [DAPO](https://huggingface.co/papers/2503.14476) paper, this is a good practice for training stability.
         sync_ref_model (`bool`, *optional*, defaults to `False`):
             Whether to synchronize the reference model with the active model every `ref_model_sync_steps` steps, using
-            the `ref_model_mixup_alpha` parameter. This synchronization originites from the
+            the `ref_model_mixup_alpha` parameter. This synchronization originates from the
             [TR-DPO](https://huggingface.co/papers/2404.09656) paper.
         ref_model_mixup_alpha (`float`, *optional*, defaults to `0.6`):
             α parameter from the [TR-DPO](https://huggingface.co/papers/2404.09656) paper, which controls the mix
@@ -230,6 +259,19 @@ class GRPOConfig(TrainingArguments):
     )
 
     # Parameters that control generation
+    generation_batch_size: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Batch size to use for generation. If `None`, it defaults to the effective training batch size: "
+            "`per_device_train_batch_size * num_processes * gradient_accumulation_steps`."
+        },
+    )
+    steps_per_generation: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Number of optimization steps per generation. If `None`, it defaults to gradient_accumulation_steps."
+        },
+    )
     temperature: float = field(
         default=0.9,
         metadata={"help": "Temperature for sampling. The higher the temperature, the more random the completions."},
@@ -272,10 +314,26 @@ class GRPOConfig(TrainingArguments):
     use_vllm: bool = field(
         default=False,
         metadata={
-            "help": "Whether to use vLLM for generating completions. If set to `True`, ensure that a vLLM server is "
-            "running. To run the server, install vLLM (`pip install vllm`) and run `trl vllm-serve`."
+            "help": "Whether to use vLLM for generating completions. If set to `True`, the trainer will use vLLM for "
+            "generation instead of the default model.generate(). Requires `vllm` to be installed."
         },
     )
+    vllm_mode: str = field(
+        default="server",
+        metadata={
+            "help": "Mode to use for vLLM integration when `use_vllm` is set to `True`. Must be one of `server` or "
+            "`'colocate'`. `'server'`: The trainer will send generation requests to a separate vLLM server. Make sure a "
+            "TRL vLLM server is running (start with `trl vllm-serve`). `'colocate'`: vLLM will run in the same "
+            "process and share the training GPUs. This avoids the need for a separate server but may cause resource "
+            "contention with training."
+        },
+    )
+    vllm_guided_decoding_regex: Optional[str] = field(
+        default=None,
+        metadata={"help": "Regex for vLLM guided decoding. If `None` (default), guided decoding is disabled."},
+    )
+
+    # Parameters that control the vLLM server (only used when `vllm_mode` is `"server"`)
     vllm_server_host: str = field(
         default="0.0.0.0",
         metadata={"help": "Host of the vLLM server to connect to."},
@@ -291,9 +349,23 @@ class GRPOConfig(TrainingArguments):
             "after the timeout, a `ConnectionError` is raised."
         },
     )
-    vllm_guided_decoding_regex: Optional[str] = field(
-        default=None,
-        metadata={"help": "Regex for vLLM guided decoding. If `None` (default), guided decoding is disabled."},
+
+    # Parameters that control colocated vLLM execution (only used when `vllm_mode` is `"colocate"`)
+    vllm_gpu_memory_utilization: float = field(
+        default=0.3,
+        metadata={
+            "help": "Control the GPU memory utilization for vLLM. This setting only applies when `vllm_mode` is set "
+            "to `'colocate'`. If you are using `vllm_mode='server'`, this parameter must be passed separately when "
+            "launching the vLLM server via the `--vllm_gpu_memory_utilization` flag."
+        },
+    )
+    vllm_tensor_parallel_size: int = field(
+        default=1,
+        metadata={
+            "help": "Control the tensor parallel size for vLLM. This setting only applies when `vllm_mode` is set "
+            "to `'colocate'`. If you are using `vllm_mode='server'`, this parameter must be passed separately when "
+            "launching the vLLM server via the `--vllm_tensor_parallel_size` flag."
+        },
     )
 
     # Parameters that control the training
@@ -318,6 +390,12 @@ class GRPOConfig(TrainingArguments):
     epsilon: float = field(
         default=0.2,
         metadata={"help": "Epsilon value for clipping."},
+    )
+    delta: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": "If set to a float value (e.g., 2.0), enables the upper clipping bound in two-sided GRPO loss. If None (default), the standard GRPO clipping is used. Recommended to be > 1 + epsilon when enabled."
+        },
     )
     epsilon_high: Optional[float] = field(
         default=None,
@@ -412,3 +490,59 @@ class GRPOConfig(TrainingArguments):
             "all prompts are logged."
         },
     )
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        num_processes = self.world_size
+        # The current default effective batch size
+        if self.generation_batch_size is not None and self.steps_per_generation is not None:
+            raise ValueError(
+                "'generation_batch_size' and 'steps_per_generation' can not be both configured at the same time"
+            )
+
+        if self.steps_per_generation is None:
+            self.steps_per_generation = self.gradient_accumulation_steps
+
+        if self.generation_batch_size is None:
+            self.generation_batch_size = self.per_device_train_batch_size * num_processes * self.steps_per_generation
+
+        if self.generation_batch_size % self.per_device_train_batch_size * num_processes != 0:
+            raise ValueError(
+                f"generation_batch_size ({self.generation_batch_size}) must be divisible by the global batch size "
+                f"({self.per_device_train_batch_size * num_processes})."
+            )
+
+        self.steps_per_generation = self.generation_batch_size // (self.per_device_train_batch_size * num_processes)
+
+        # Check if the effective batch size can be divided by the number of generations
+        if self.num_generations < 2:
+            raise ValueError(
+                "GRPO requires at least 2 generations per prompt to calculate the advantages. You provided "
+                f"{self.num_generations}, which is less than the minimum required."
+            )
+        possible_values = [
+            n_gen for n_gen in range(2, self.generation_batch_size + 1) if (self.generation_batch_size) % n_gen == 0
+        ]
+
+        if self.num_generations not in possible_values:
+            raise ValueError(
+                f"The effective train batch size ({num_processes} x {self.per_device_train_batch_size} x "
+                f"{self.steps_per_generation}) must be evenly divisible by the number of generations per "
+                f"prompt ({self.num_generations}). Given the current effective train batch size, the valid values for "
+                f"the number of generations are: {possible_values}."
+            )
+        if self.eval_strategy != "no":
+            global_eval_batch_size = self.per_device_eval_batch_size * num_processes
+            possible_values = [
+                n_gen for n_gen in range(2, global_eval_batch_size + 1) if (global_eval_batch_size) % n_gen == 0
+            ]
+            if self.num_generations not in possible_values:
+                raise ValueError(
+                    f"The global eval batch size ({num_processes} x {self.per_device_eval_batch_size}) must be "
+                    f"evenly divisible by the number of generations per prompt ({self.num_generations}). Given the "
+                    "current global eval batch size, the valid values for the number of generations are: "
+                    f"{possible_values}."
+                )
+        if self.delta is not None and self.use_liger_loss:
+            raise ValueError("Liger loss does not support two-sided GRPO loss yet.")

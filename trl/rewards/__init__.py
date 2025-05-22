@@ -12,7 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from setuptools import setup
+
+import sys
+from typing import TYPE_CHECKING
+
+from ..import_utils import _LazyModule
 
 
-setup()
+_import_structure = {
+    "format_rewards": ["think_format_reward"],
+}
+
+
+if TYPE_CHECKING:
+    from .format_rewards import think_format_reward
+
+
+else:
+    sys.modules[__name__] = _LazyModule(__name__, __file__, _import_structure, module_spec=__spec__)

@@ -24,13 +24,84 @@ from transformers.testing_utils import require_peft
 from transformers.utils import is_peft_available
 
 from trl import GRPOConfig, GRPOTrainer
-from trl.trainer.grpo_trainer import RepeatSampler
+from trl.trainer.grpo_trainer import RepeatSampler, shuffle_tensor_dict, split_tensor_dict
 
 from .testing_utils import require_vllm
 
 
 if is_peft_available():
     from peft import LoraConfig, PeftModel
+
+
+class SplitTensorDictTester(unittest.TestCase):
+    def test_split_equal_chunks(self):
+        x = torch.arange(12).reshape(6, 2)
+        y = torch.arange(6).reshape(6, 1)
+        tensor_dict = {"x": x, "y": y}
+
+        result = split_tensor_dict(tensor_dict, 3)
+
+        expected_x_chunks = torch.chunk(x, 3, dim=0)
+        expected_y_chunks = torch.chunk(y, 3, dim=0)
+        self.assertEqual(len(result), 3)
+        for i in range(3):
+            self.assertTrue(torch.equal(result[i]["x"], expected_x_chunks[i]))
+            self.assertTrue(torch.equal(result[i]["y"], expected_y_chunks[i]))
+
+    def test_with_none_tensor(self):
+        x = torch.arange(12).reshape(6, 2)
+        tensor_dict = {"x": x, "y": None}
+
+        result = split_tensor_dict(tensor_dict, 2)
+
+        expected_x_chunks = torch.chunk(x, 2, dim=0)
+        self.assertEqual(len(result), 2)
+        for i in range(2):
+            self.assertTrue(torch.equal(result[i]["x"], expected_x_chunks[i]))
+            self.assertIsNone(result[i]["y"])
+
+
+class ShuffleTensorDictTester(unittest.TestCase):
+    def test_shuffle_preserves_shape(self):
+        x = torch.arange(6).reshape(3, 2)
+        y = torch.arange(3).reshape(3, 1)
+        tensor_dict = {"x": x.clone(), "y": y.clone()}
+
+        shuffled = shuffle_tensor_dict(tensor_dict)
+
+        self.assertEqual(shuffled["x"].shape, x.shape)
+        self.assertEqual(shuffled["y"].shape, y.shape)
+
+    def test_shuffle_consistent_across_tensors(self):
+        # Use known patterns to check alignment
+        x = torch.tensor([[10, 11], [20, 21], [30, 31]])
+        y = torch.tensor([[1], [2], [3]])
+        tensor_dict = {"x": x.clone(), "y": y.clone()}
+
+        shuffled = shuffle_tensor_dict(tensor_dict)
+
+        # Build a reverse map from shuffled x rows to y values
+        for i in range(3):
+            x_row = shuffled["x"][i]
+            y_val = shuffled["y"][i].item()
+
+            if torch.equal(x_row, torch.tensor([10, 11])):
+                self.assertEqual(y_val, 1)
+            elif torch.equal(x_row, torch.tensor([20, 21])):
+                self.assertEqual(y_val, 2)
+            elif torch.equal(x_row, torch.tensor([30, 31])):
+                self.assertEqual(y_val, 3)
+            else:
+                self.fail("Unexpected x row in shuffled output.")
+
+    def test_none_tensor_remains_none(self):
+        x = torch.arange(6).reshape(3, 2)
+        tensor_dict = {"x": x.clone(), "y": None}
+
+        shuffled = shuffle_tensor_dict(tensor_dict)
+
+        self.assertIsNone(shuffled["y"])
+        self.assertEqual(shuffled["x"].shape, x.shape)
 
 
 class RepeatRandomSamplerTester(unittest.TestCase):
@@ -1076,3 +1147,84 @@ class GRPOTrainerTester(unittest.TestCase):
             for n, param in previous_trainable_params.items():
                 new_param = trainer.model.get_parameter(n)
                 self.assertFalse(torch.equal(param, new_param), f"Parameter {n} has not changed.")
+
+    @staticmethod
+    def _make_delta_trainer(tmp_dir, tokenizer, dataset):
+        """Helper method to create a GRPOTrainer with specific delta clipping parameters."""
+        cfg = GRPOConfig(
+            output_dir=tmp_dir,
+            epsilon=0.20,
+            delta=2.0,
+            epsilon_high=0.20,
+            beta=0.0,
+            loss_type="bnpo",
+            max_completion_length=2,
+            report_to="none",
+        )
+        return GRPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+            args=cfg,
+            reward_funcs=lambda x, **y: [1.0] * len(x),
+            train_dataset=dataset,
+            processing_class=tokenizer,
+        )
+
+    @staticmethod
+    def _delta_inputs(device):
+        """Helper method to create standard inputs for delta clipping tests."""
+        return {
+            "prompt_ids": torch.tensor([[101]], device=device),
+            "prompt_mask": torch.tensor([[1]], device=device),
+            "completion_ids": torch.tensor([[2000, 2001]], device=device),
+            "completion_mask": torch.tensor([[1, 1]], device=device),
+        }
+
+    @parameterized.expand(
+        [
+            # name, advantage, old_prob, new_prob, expected_loss
+            ("pos_ratio_in_clip", 2.0, 0.50, 0.55, -2.2),
+            ("pos_ratio_above_clip", 2.0, 0.40, 0.60, -2.4),
+            ("neg_ratio_in_clip", -2.0, 0.50, 0.45, 1.8),
+            ("neg_ratio_below_clip", -2.0, 0.50, 0.35, 1.6),
+            ("neg_ratio_above_delta", -2.0, 0.20, 0.50, 4.0),
+            ("neg_between_clip_delta", -2.0, 0.40, 0.60, 3.0),
+        ]
+    )
+    def test_two_sided_clipping_loss(self, name, advantage, old_prob, new_prob, expected_loss):
+        """Test two-sided GRPO clipping logic with different scenarios.
+
+        Args:
+            name: Test case name
+            advantage: Advantage value for the scenario
+            old_prob: Old policy probability
+            new_prob: New policy probability
+            expected_loss: Expected loss value
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
+            tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+            dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train[:1]")
+
+            trainer = self._make_delta_trainer(tmp_dir, tokenizer, dataset)
+
+            inputs = self._delta_inputs(trainer.accelerator.device)
+            inputs.update(
+                {
+                    "advantages": torch.tensor([advantage], device=trainer.accelerator.device),
+                    "old_per_token_logps": torch.log(torch.tensor([[old_prob]], device=trainer.accelerator.device)),
+                }
+            )
+
+            # Mock _get_per_token_logps to return predefined new log probabilities
+            with patch.object(trainer, "_get_per_token_logps") as mock_logps_func:
+                mock_logps_func.return_value = torch.log(torch.tensor([[new_prob]], device=trainer.accelerator.device))
+
+                # Compute loss and verify
+                loss = trainer.compute_loss(trainer.model, inputs)
+                self.assertAlmostEqual(
+                    loss.item(),
+                    expected_loss,
+                    delta=1e-5,
+                    msg=f"Scenario {name} failed: expected {expected_loss}, got {loss.item()}",
+                )
