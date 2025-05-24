@@ -94,6 +94,8 @@ _import_structure = {
         "WinRateCallback",
         "XPOConfig",
         "XPOTrainer",
+        "XFTConfig",
+        "XFTTrainer"
     ],
     "trainer.callbacks": ["MergeModelCallback", "RichProgressCallback", "SyncRefModelCallback"],
     "trainer.utils": ["get_kbit_device_map", "get_peft_config", "get_quantization_config"],
@@ -190,6 +192,8 @@ if TYPE_CHECKING:
         WinRateCallback,
         XPOConfig,
         XPOTrainer,
+        XFTConfig,
+        XFTTrainer
     )
     from .trainer.callbacks import RichProgressCallback, SyncRefModelCallback
     from .trainer.utils import get_kbit_device_map, get_peft_config, get_quantization_config

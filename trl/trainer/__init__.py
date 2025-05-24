@@ -82,6 +82,9 @@ _import_structure = {
     ],
     "xpo_config": ["XPOConfig"],
     "xpo_trainer": ["XPOTrainer"],
+    "xft_config": ["XFTConfig"],
+    "xft_trainer": ["XFTTrainer"]
+
 }
 try:
     if not is_diffusers_available():
@@ -140,6 +143,9 @@ if TYPE_CHECKING:
     from .reward_trainer import RewardTrainer
     from .rft_config import RFTConfig
     from .rft_trainer import RFTTrainer
+    
+    from .xft_config import XFTConfig
+    from .xft_trainer import XFTTrainer    
     from .rloo_config import RLOOConfig
     from .rloo_trainer import RLOOTrainer
     from .sft_config import SFTConfig

@@ -281,53 +281,85 @@ def process_rewards(overall,steps, config):
         
     return combined_scores
 
-def split_cot(text, delim, threshold_factor=1.0):
-    import re
 
-    def split_on_empty_lines(text):
-        """
-        Splits the input text into sections separated by empty lines.
-        Handles lines that are completely empty or contain only whitespace.
-        """
-        return [chunk.strip() for chunk in re.split(r'\n\s*\n', text.strip()) if chunk.strip()]
 
-    raw_entries = split_on_empty_lines(text)
-    
-    fused_entries = []
-    n = len(raw_entries)
-    lengths = [len(entry) for entry in raw_entries]
 
+
+def split_cot(text, delim="\n\n", threshold_factor=1.0, min_length=150):
+    """
+    Combine two splitting strategies for chain-of-thought:
+    1. Roughly split on paragraphs, headings, bullets, or sentence boundaries.
+    2. Merge short segments forward based on min_length.
+    3. Fuse undersized segments with their successor based on statistical threshold.
+
+    Parameters:
+    - text (str): the input chain-of-thought text
+    - delim (list[str]): list of additional regex delimiters to apply
+    - threshold_factor (float): factor for std-based fusion threshold
+    - min_length (int): minimum length for merged chunks
+    """
+    import re, statistics
+
+    # Stage 1: rough segmentation
+    delimiters = [
+        r'\n\s*###\s+',
+        r'\n\s*[-*]\s+',
+        r'\n{2,}',
+        r'(?<=\.)\s+(?=[A-Z])',
+    ]
+    # incorporate user-provided extra delimiters
+    delimiters.extend(delim)
+
+    pattern = '|'.join(delimiters)
+    raw_chunks = [chunk.strip() for chunk in re.split(pattern, text) if chunk.strip()]
+
+    # Stage 2: merge short chunks by min_length
+    merged_chunks = []
+    buffer = ""
+    for chunk in raw_chunks:
+        if len(buffer) + len(chunk) < min_length:
+            buffer = (buffer + " " + chunk).strip() if buffer else chunk
+        else:
+            if buffer:
+                merged_chunks.append(buffer)
+            buffer = chunk
+    if buffer:
+        merged_chunks.append(buffer)
+
+    # Stage 3: threshold-based fusion using delim
+    fused = []
+    n = len(merged_chunks)
+    lengths = [len(c) for c in merged_chunks]
     i = 0
     while i < n:
-        entry = raw_entries[i]
-        current_len = len(entry)
-        # Compute lengths for all other entries (exclude the current one)
+        curr = merged_chunks[i]
+        curr_len = len(curr)
         others = lengths[:i] + lengths[i+1:]
         if others:
-            avg_length = sum(others) / len(others)
-            # Use sample standard deviation if there are at least two other entries
-            std_dev = statistics.stdev(others) if len(others) > 1 else 0
+            avg = sum(others) / len(others)
+            std = statistics.stdev(others) if len(others) > 1 else 0
         else:
-            avg_length = current_len
-            std_dev = 0
-
-        # Define a threshold based on the average minus a multiple of the standard deviation
-        threshold = max(avg_length - threshold_factor * std_dev, 0)
-
-        # If the current entry's length is below the threshold and there's a next entry, fuse them
-        if current_len < threshold and i + 1 < n:
-            fused_entry = entry + delim + raw_entries[i + 1]
-            fused_entries.append(fused_entry)
-            i += 2 
+            avg, std = curr_len, 0
+        threshold = max(avg - threshold_factor * std, 0)
+        if curr_len < threshold and i + 1 < n:
+            fused.append(curr + delim + merged_chunks[i+1])
+            i += 2
         else:
-            fused_entries.append(entry)
+            fused.append(curr)
             i += 1
 
-    return fused_entries
+    return fused
 
 
 
 
 
 
+def print_colored_strings(strings):
+    # List of colors with their ANSI codes
+    colors = ["red", "green", "yellow", "blue", "magenta", "cyan", "white"]
+    
+    # Cycle through colors for each string
+    for i, string in enumerate(strings):
+        printc(string, colors[i % len(colors)])
 
