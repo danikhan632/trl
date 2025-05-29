@@ -233,6 +233,10 @@ class RFTConfig(TrainingArguments):
         default=0.04,
         metadata={"help": "KL divergence coefficient (penalty) in the RFT objective."},
     )
+    beta_old_new: float = field(
+        default=0.01,
+        metadata={"help": "KL divergence coefficient between old and new policy."},
+    )
     cliprange: float = field(
         default=0.2,
         metadata={"help": "Clipping range for the PPO surrogate objective ratio."},

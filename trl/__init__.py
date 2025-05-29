@@ -36,6 +36,7 @@ _import_structure = {
     ],
     "environment": ["TextEnvironment", "TextHistory"],
     "extras": ["BestOfNSampler"],
+    "grad_utils": ["compute_masked_gradients", "get_token_mask"],
     "models": [
         "SUPPORTED_ARCHITECTURES",
         "AutoModelForCausalLMWithValueHead",
@@ -133,6 +134,7 @@ if TYPE_CHECKING:
     )
     from .environment import TextEnvironment, TextHistory
     from .extras import BestOfNSampler
+    from .grad_utils import compute_masked_gradients, get_token_mask
     from .models import (
         SUPPORTED_ARCHITECTURES,
         AutoModelForCausalLMWithValueHead,
