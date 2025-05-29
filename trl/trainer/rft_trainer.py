@@ -17,6 +17,7 @@ from collections import defaultdict
 from typing import Any, Callable, Optional, Union
 from unittest.mock import patch
 import sys
+import copy
 import torch
 import torch.nn.functional as F
 import torch.utils.data
@@ -192,6 +193,11 @@ class RFTTrainer(Trainer):
 
         # Validate value head placement and dtype
         self._check_value_head()
+
+        # Keep a frozen copy of the policy for rollouts
+        self.old_model = copy.deepcopy(self.model)
+        self.old_model.eval()
+        self.old_model = self.accelerator.prepare_model(self.old_model, evaluation_mode=True)
 
     def _validate_rft_config(self, cfg: RFTConfig) -> RFTConfig:
         if not isinstance(cfg, RFTConfig):
@@ -1177,7 +1183,7 @@ class RFTTrainer(Trainer):
                 # --- 2. Generate Full CoT Sequence (Policy Model "Old" Outputs) ---
                 prompt_completion_ids, full_policy_log_probs_initial, full_policy_hidden_states_initial = \
                     self._generate_sequence_and_get_model_outputs(
-                        self.model, prompt_tokens, f"E{epoch+1}_S{self.state.global_step}_PolicyRollout",
+                        self.old_model, prompt_tokens, f"E{epoch+1}_S{self.state.global_step}_PolicyRollout",
                         is_trainable_policy_model=False,
                         get_hidden_states_flag=True
                     )
@@ -1266,6 +1272,17 @@ class RFTTrainer(Trainer):
                     printc(f"NaN/Inf in training log_probs for E{epoch+1}_S{self.state.global_step}", "red")
                     continue
 
+                # --- 8b. KL Divergence between Old and New Policy ---
+                old_new_kl_div = self.get_full_kl_divergence(
+                    full_policy_log_probs_train[:, :-1, :],
+                    full_policy_log_probs_initial[:, :-1, :],
+                    prompt_completion_ids,
+                )
+                if old_new_kl_div is None:
+                    old_new_kl_mean = torch.tensor(0.0, device=device)
+                else:
+                    old_new_kl_mean = old_new_kl_div.mean()
+
                 # Compute cumulative KL sums for efficiency
                 kl_cumsum = torch.cumsum(full_kl_div, dim=1)  # Shape (B, L-1)
 
@@ -1353,7 +1370,7 @@ class RFTTrainer(Trainer):
                     continue
 
                 # Compute total loss for the item
-                total_loss = sum(thought_losses)
+                total_loss = sum(thought_losses) + self.rft_config.beta_old_new * old_new_kl_mean
 
                 # Perform a single backward pass
                 actual_loss_to_backward = total_loss / self.rft_config.gradient_accumulation_steps
@@ -1367,6 +1384,8 @@ class RFTTrainer(Trainer):
                     
                     self.optimizer.step()
                     if not self.accelerator.optimizer_step_was_skipped:
+                        self.old_model.load_state_dict(self.model.state_dict())
+                        self.old_model.eval()
                         if self.lr_scheduler is not None:
                             self.lr_scheduler.step()
                     
@@ -1381,6 +1400,7 @@ class RFTTrainer(Trainer):
                         "value_loss_step": step_value_loss.item(),
                         "kl_loss_step": step_kl_penalty_loss.item(),
                         "kl_avg": current_item_kl_sum / num_thought_segments if num_thought_segments > 0 else 0,
+                        "kl_old_new": old_new_kl_mean.item(),
                         "learning_rate": self.lr_scheduler.get_last_lr()[0] if self.lr_scheduler else self.optimizer.param_groups[0]['lr'],
                         "epoch": epoch + ((self.state.global_step * self.rft_config.gradient_accumulation_steps) / len_dataloader if len_dataloader else 0)
                     }
